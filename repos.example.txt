@@ -1,0 +1,27 @@
+# Example repos configuration file
+# List one repository path per line
+# Lines starting with # are ignored
+# Supports ~/ for home directory
+# Supports relative paths
+
+# Your active projects:
+~/Code/project1
+~/Code/project2
+~/Code/my-api-service
+~/Code/web-frontend
+
+# You can also use relative paths:
+./project-a
+./project-b
+
+# This is a comment - this line is ignored
+# ~/Code/archived-project  # This repo is commented out and will be ignored
+
+# Ignore patterns work on repo names:
+# If you have folders like:
+#   ~/Code/project1 (active)
+#   ~/Code/project2 (active)  
+#   ~/Code/archive/old-project (ignored via pattern)
+#   ~/Code/temp-test (ignored via pattern)
+#
+# Then use: --ignore "archive/*" "temp-*"
