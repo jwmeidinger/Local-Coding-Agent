@@ -3,8 +3,12 @@ __pycache__/
 
 # Virtual environments
 venv/
+.venv/
 
 # Environment and secrets (use .env.example as template)
 .env
 .env.local
 !.env.example
+
+# Agent runtime artifacts
+.coding-agent/

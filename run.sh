@@ -34,16 +34,50 @@ VERBOSE="${VERBOSE:-false}"
 # Path to coding_agent.py
 AGENT_SCRIPT="${AGENT_SCRIPT:-$(dirname "$0")/coding_agent.py}"
 
+# Python interpreter selection:
+# 1) PYTHON_BIN override
+# 2) project-local virtualenv
+# 3) python3 from PATH
+# 4) python from PATH
+if [ -n "${PYTHON_BIN:-}" ]; then
+  PYTHON="$PYTHON_BIN"
+elif [ -x "$(dirname "$0")/.venv/bin/python" ]; then
+  PYTHON="$(dirname "$0")/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON="python3"
+else
+  PYTHON="python"
+fi
+
 # ---- List models (--list-models / -l) -----------------------------------------
 if [ "${1:-}" = "--list-models" ] || [ "${1:-}" = "-l" ]; then
   echo "Listing models at $LLM_URL"
+  [ -n "${SOURCE_IP:-}" ] && echo "Binding to source IP: $SOURCE_IP"
   echo ""
-  python3 -c "
+  "$PYTHON" -c "
 import urllib.request
 import json
+import socket
 import sys
 
 url = sys.argv[1].rstrip('/')
+source_ip = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else ''
+
+# ---- Monkey-patch socket.create_connection to bind to source IP ----
+# This forces ALL urllib (and http.client) traffic through the specified
+# network interface, bypassing VPN default routes.
+if source_ip:
+    _orig_create_connection = socket.create_connection
+
+    def _bound_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+                                  source_address=None, **kwargs):
+        # Force source_address to our chosen IP if not already set
+        if source_address is None:
+            source_address = (source_ip, 0)
+        return _orig_create_connection(address, timeout, source_address, **kwargs)
+
+    socket.create_connection = _bound_create_connection
+    print(f'Bound outgoing connections to {source_ip}', file=sys.stderr)
 
 def try_openai_compat():
     '''LM Studio and other OpenAI-compatible servers: GET /v1/models'''
@@ -54,8 +88,8 @@ def try_openai_compat():
             for m in d['data']:
                 print(m.get('id', str(m)))
             return 'openai'
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'OpenAI-compat probe failed: {e}', file=sys.stderr)
     return None
 
 def try_ollama():
@@ -67,8 +101,8 @@ def try_ollama():
             for m in d['models']:
                 print(m.get('name', m.get('model', m)))
             return 'ollama'
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'Ollama probe failed: {e}', file=sys.stderr)
     return None
 
 # Try OpenAI-compat first so we never hit /api/tags on LM Studio (it returns 200 + error)
@@ -82,26 +116,33 @@ if kind is None:
     sys.exit(1)
 
 print(f'Detected: {kind}', file=sys.stderr)
-" "$LLM_URL"
+" "$LLM_URL" "${SOURCE_IP:-}"
   exit 0
 fi
 
 # ---- Build command ------------------------------------------------------------
-CMD="python \"$AGENT_SCRIPT\" \
-  --repo \"$REPO_PATH\" \
-  --llm-url \"$LLM_URL\" \
-  --model \"$MODEL\" \
-  --base-branch \"$BASE_BRANCH\" \
-  --branch-prefix \"$BRANCH_PREFIX\" \
-  --max-iterations $MAX_ITERATIONS"
+CMD=(
+  "$PYTHON" "$AGENT_SCRIPT"
+  --repo "$REPO_PATH"
+  --llm-url "$LLM_URL"
+  --model "$MODEL"
+  --base-branch "$BASE_BRANCH"
+  --branch-prefix "$BRANCH_PREFIX"
+  --max-iterations "$MAX_ITERATIONS"
+)
 
 if [ -n "${SOURCE_IP:-}" ]; then
-  CMD="$CMD --source-ip \"$SOURCE_IP\""
+  CMD+=(--source-ip "$SOURCE_IP")
 fi
 
 if [ "$VERBOSE" = "true" ]; then
-  CMD="$CMD --verbose"
+  CMD+=(--verbose)
 fi
+
+# ---- Pass through extra arguments (fixes --index, --search, etc.) -------------
+# This makes ./run.sh --index actually reach coding_agent.py and index the correct repo
+CMD+=("$@")
+# -------------------------------------------------------------------------------
 
 # ---- Run --------------------------------------------------------------------
 echo "Starting Coding Agent..."
@@ -110,4 +151,4 @@ echo "Model: $MODEL"
 [ -n "${SOURCE_IP:-}" ] && echo "Source IP: $SOURCE_IP"
 echo ""
 
-eval $CMD
+"${CMD[@]}"

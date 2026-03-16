@@ -1,11 +1,13 @@
 # Core dependencies
-langchain-community>=0.0.20
 GitPython>=3.1.40
 psycopg2-binary>=2.9.9
-exa-py>=1.0.0
+ddgs>=9.11.2
 
 # Optional: For better embeddings (OpenAI)
 # openai>=1.0.0
 
 # Optional: For local embeddings (better than fallback)
 # sentence-transformers>=2.2.0
+
+# Optional: Premium web search backend
+# exa-py>=1.0.0

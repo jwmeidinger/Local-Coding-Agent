@@ -154,7 +154,7 @@ your-project/
   tasks/                    # Drop task files here
     refactor-auth.txt
     add-tests.txt
-  skills/                   # Custom skills (optional)
+  skills/                   # Custom skills only (see skills/README.md)
     my-skill.json
   soul.md                   # Custom context for the agent (optional)
   .coding-agent/            # Agent workspace
@@ -250,7 +250,8 @@ For multi-repo configuration, see [MULTI_REPO.md](./MULTI_REPO.md).
 
 ### Creating Custom Skills
 
-Add custom skills by creating JSON files in `skills/`:
+Add custom skills by creating JSON files in `skills/`.
+Built-in defaults are `refactor`, `feature`, `bugfix`, `docs`, and `test` (do not re-add these):
 
 ```json
 {

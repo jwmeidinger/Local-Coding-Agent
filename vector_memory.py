@@ -74,7 +74,7 @@ class VectorMemoryManager:
             self.conn = psycopg2.connect(**self.db_config)
             self.logger.info(f"Connected to Postgres database: {self.db_config['database']}")
         except Exception as e:
-            self.logger.error(f"Failed to connect to database: {e}")
+            self.logger.warning("Failed to connect to vector memory database: %r", e)
             raise
     
     def _ensure_schema(self):
