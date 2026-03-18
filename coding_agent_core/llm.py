@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 from .config import AgentConfig
@@ -21,6 +22,20 @@ class LLMManager:
         self.model = config.model
         self.temperature = config.temperature
         self.num_predict = config.num_predict
+
+        # Setup dedicated LLM logger
+        self.llm_logger = logging.getLogger("coding-agent.llm")
+        self.llm_logger.setLevel(logging.DEBUG if config.verbose else logging.INFO)
+        
+        # Add file handler for LLM logs
+        llm_log_path = config.workspace_dir / "llm.log"
+        try:
+            llm_handler = logging.FileHandler(llm_log_path, mode="w", encoding="utf-8")
+            llm_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S"))
+            self.llm_logger.addHandler(llm_handler)
+            self.llm_logger.info(f"LLM log file: {llm_log_path}")
+        except Exception as e:
+            self.llm_logger.warning(f"Could not create LLM log file: {e}")
 
         # Detect server type
         self.server_type = self._detect_server_type()
@@ -82,10 +97,24 @@ class LLMManager:
                 total, len(system_prompt) + len(prompt),
             )
 
+        # Log the prompt being sent
+        self.llm_logger.info("=" * 60)
+        self.llm_logger.info(f"MODEL: {self.model}")
+        self.llm_logger.info(f"TEMP: {self.temperature}")
+        if system_prompt:
+            self.llm_logger.info(f"SYSTEM PROMPT:\n{system_prompt[:500]}...")
+        self.llm_logger.info(f"USER PROMPT:\n{prompt[:1000]}...")
+        self.llm_logger.info("-" * 60)
+
         if self.server_type == "openai":
-            return self._generate_openai(prompt, system_prompt, _req)
+            response = self._generate_openai(prompt, system_prompt, _req)
         else:
-            return self._generate_ollama(prompt, system_prompt, _req)
+            response = self._generate_ollama(prompt, system_prompt, _req)
+
+        self.llm_logger.info(f"RESPONSE:\n{response[:1500]}...")
+        self.llm_logger.info("=" * 60)
+        
+        return response
 
     def _generate_openai(self, prompt: str, system_prompt: str, _req) -> str:
         """Generate via OpenAI-compatible /v1/chat/completions (LM Studio, vLLM)."""

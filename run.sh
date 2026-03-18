@@ -31,6 +31,12 @@ BRANCH_PREFIX="${BRANCH_PREFIX:-agent/}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-5}"
 VERBOSE="${VERBOSE:-false}"
 
+# Enable verbose mode with -v flag
+if [ "${1:-}" = "-v" ] || [ "${1:-}" = "--verbose" ]; then
+  VERBOSE="true"
+  shift
+fi
+
 # Path to coding_agent.py
 AGENT_SCRIPT="${AGENT_SCRIPT:-$(dirname "$0")/coding_agent.py}"
 
@@ -149,6 +155,11 @@ echo "Starting Coding Agent..."
 echo "Repository: $REPO_PATH"
 echo "Model: $MODEL"
 [ -n "${SOURCE_IP:-}" ] && echo "Source IP: $SOURCE_IP"
+[ "$VERBOSE" = "true" ] && echo "Verbose mode: ENABLED"
+echo ""
+echo "Log files:"
+echo "  - .coding-agent/agent.log   (main agent log)"
+echo "  - .coding-agent/llm.log    (LLM requests/responses)"
 echo ""
 
 "${CMD[@]}"

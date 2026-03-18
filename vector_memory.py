@@ -74,7 +74,8 @@ class VectorMemoryManager:
             self.conn = psycopg2.connect(**self.db_config)
             self.logger.info(f"Connected to Postgres database: {self.db_config['database']}")
         except Exception as e:
-            self.logger.warning("Failed to connect to vector memory database: %r", e)
+            self.logger.error("Failed to connect to vector memory database: %r", e)
+            self.logger.info("To fix: Run 'docker-compose up -d' to start the database")
             raise
     
     def _ensure_schema(self):
@@ -191,12 +192,16 @@ class VectorMemoryManager:
         ignore_patterns = ignore_patterns or []
         
         # Get list of files currently in database for this repo
-        with self.conn.cursor() as cur:
-            cur.execute(
-                "SELECT file_path, content_hash FROM code_embeddings WHERE repo_path = %s",
-                (repo_str,)
-            )
-            existing_files = {row[0]: row[1] for row in cur.fetchall()}
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT file_path, content_hash FROM code_embeddings WHERE repo_path = %s",
+                    (repo_str,)
+                )
+                existing_files = {row[0]: row[1] for row in cur.fetchall()}
+        except Exception as e:
+            self.logger.warning(f"Could not fetch existing files from DB: {e}")
+            existing_files = {}
         
         # Find all source files
         source_extensions = {'.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go', '.rs', '.cpp', '.c', '.h', '.rb', '.php'}

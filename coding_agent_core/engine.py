@@ -67,6 +67,11 @@ class ExecutionEngine:
                 # If no files indexed, offer to index
                 if "No files indexed" in summary:
                     self.logger.info("Codebase not indexed yet. Run with --index to index first.")
+                    # Auto-index the codebase
+                    self.logger.info("Auto-indexing codebase...")
+                    self.memory_manager.index_codebase()
+                    summary = self.memory_manager.get_codebase_summary()
+                    self.logger.info(f"Codebase memory after indexing: {summary}")
             except Exception as e:
                 self.logger.warning(f"Could not get codebase summary: {e}")
         
@@ -302,12 +307,15 @@ You MUST output tool calls in EXACTLY this format (one per response):
 
     list_files(path="src")
 
-## Rules
-1. Call ONE tool per response
-2. Start by reading existing files with file_read or list_files
-3. Write files with file_write
-4. Run commands with bash
-5. When done, say DONE
+## CRITICAL RULES
+1. BEFORE reading any file, use list_files to see what files exist in that directory
+2. If a file_read fails with "not found", use list_files to find the correct path
+3. Do NOT guess file paths - explore the directory structure first
+4. Call ONE tool per response
+5. Start by listing files in the repository to understand the structure
+6. Write files with file_write
+7. Run commands with bash
+8. When done, say DONE
 
 ## IMPORTANT
 - Do NOT write long explanations. Just call the tool.
@@ -349,6 +357,11 @@ list_files(path=".")
                 self.logger.info(f"Executing: {tool_call}")
                 result = self.tools.execute(tool_call)
                 self.logger.info(f"Result: {result[:200]}...")
+                
+                # If file not found, add explicit guidance
+                if "not found" in result.lower():
+                    result += "\n\nIMPORTANT: Use list_files to find the correct path before trying file_read again."
+                
                 prompt += f"\n\nExecuted: {tool_call}\nResult:\n{result[:2000]}\n\nCall the next tool (or say DONE if finished):"
         
         return True

@@ -72,7 +72,7 @@ class FileReadTool:
             if not file_path.is_absolute():
                 file_path = self.cwd / file_path
             if not file_path.exists():
-                return f"Error: File {path} not found"
+                return f"Error: File '{path}' not found. Use list_files to explore the directory structure first. The cwd is: {self.cwd}"
             return file_path.read_text(encoding="utf-8")
         except Exception as e:
             return f"Error reading file: {e}"
@@ -212,7 +212,7 @@ class ListFilesTool:
             if not dir_path.is_absolute():
                 dir_path = self.cwd / dir_path
             if not dir_path.exists():
-                return f"Error: Directory {path} not found"
+                return f"Error: Directory '{path}' not found. Available directories in {self.cwd}:\n" + "\n".join([str(f.relative_to(self.cwd)) for f in self.cwd.iterdir()])[:500]
             files = list(dir_path.glob(pattern))
             return "\n".join([str(f.relative_to(dir_path)) for f in files])
         except Exception as e:
