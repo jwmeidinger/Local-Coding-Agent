@@ -68,6 +68,13 @@ Examples:
     
     parser.add_argument("--max-iterations", type=int, default=5,
                         help="Max execution iterations per task")
+    parser.add_argument("--max-prompt-chars", type=int, default=40000,
+                        help="Max characters sent to LLM per request (~10k tokens). "
+                             "Lower this if your model has a small context window. (default: 40000)")
+    parser.add_argument("--max-tool-result-chars", type=int, default=1500,
+                        help="Max characters kept per tool result in context (default: 1500)")
+    parser.add_argument("--max-consecutive-errors", type=int, default=2,
+                        help="Abort after N consecutive LLM failures/timeouts (default: 2)")
     parser.add_argument("--no-commit", action="store_true",
                         help="Don't auto-commit changes")
     
@@ -191,7 +198,10 @@ Examples:
         model=args.model,
         source_ip=args.source_ip,
         temperature=args.temperature,
+        max_prompt_chars=args.max_prompt_chars,
+        max_tool_result_chars=args.max_tool_result_chars,
         max_iterations=args.max_iterations,
+        max_consecutive_errors=args.max_consecutive_errors,
         auto_commit=not args.no_commit,
         verbose=args.verbose,
     )

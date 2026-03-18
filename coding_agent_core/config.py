@@ -27,10 +27,13 @@ class AgentConfig:
     temperature: float = 0.1
     num_predict: int = 8192
     source_ip: str = ""  # Bind to specific local IP to bypass VPNs
+    max_prompt_chars: int = 40000  # ~10k tokens — safe for most local models
+    max_tool_result_chars: int = 1500  # Truncate individual tool results in context
     
     # Execution settings
     max_iterations: int = 5
     max_retries: int = 2
+    max_consecutive_errors: int = 2  # Bail after N consecutive LLM failures
     auto_commit: bool = True
     verbose: bool = False
 

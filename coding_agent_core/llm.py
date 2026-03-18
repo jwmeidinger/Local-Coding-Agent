@@ -73,50 +73,53 @@ class LLMManager:
         )
         return "openai"
 
-    # Maximum characters to send to the LLM (rough estimate: ~4 chars per token).
-    # Adjust this based on your model's context window size.
-    # 50k tokens ≈ 200k chars; leave room for the response.
-    MAX_PROMPT_CHARS = 180000
-
-    def generate(self, prompt: str, system_prompt: str = "") -> str:
-        """Generate text using the LLM, with automatic prompt truncation."""
+    def generate(self, prompt: str, system_prompt: str = "", force_tool: str = None) -> str:
+        """Generate text using the LLM, with automatic prompt truncation.
+        
+        Args:
+            prompt: The user prompt
+            system_prompt: The system prompt
+            force_tool: If set, force the model to call this specific tool
+        """
         import requests as _req
 
-        # Truncate if the combined prompt is too large
+        max_chars = getattr(self.config, "max_prompt_chars", 40000)
+
         total = len(system_prompt) + len(prompt)
-        if total > self.MAX_PROMPT_CHARS:
+        if total > max_chars:
             logger = logging.getLogger("coding-agent")
-            budget = self.MAX_PROMPT_CHARS - len(system_prompt)
+            budget = max_chars - len(system_prompt)
             if budget < 2000:
-                # System prompt is huge too — trim both
                 system_prompt = system_prompt[:2000] + "\n...(truncated)"
-                budget = self.MAX_PROMPT_CHARS - len(system_prompt)
+                budget = max_chars - len(system_prompt)
             prompt = prompt[:budget] + "\n\n...(prompt truncated to fit context window)"
             logger.warning(
-                "Prompt truncated from %d to %d chars to fit model context",
-                total, len(system_prompt) + len(prompt),
+                "Prompt truncated from %d to %d chars (limit %d)",
+                total, len(system_prompt) + len(prompt), max_chars,
             )
 
         # Log the prompt being sent
         self.llm_logger.info("=" * 60)
         self.llm_logger.info(f"MODEL: {self.model}")
         self.llm_logger.info(f"TEMP: {self.temperature}")
+        if force_tool:
+            self.llm_logger.info(f"FORCED TOOL: {force_tool}")
         if system_prompt:
             self.llm_logger.info(f"SYSTEM PROMPT:\n{system_prompt}")
         self.llm_logger.info(f"USER PROMPT:\n{prompt}")
         self.llm_logger.info("-" * 60)
 
         if self.server_type == "openai":
-            response = self._generate_openai(prompt, system_prompt, _req)
+            response = self._generate_openai(prompt, system_prompt, _req, force_tool)
         else:
-            response = self._generate_ollama(prompt, system_prompt, _req)
+            response = self._generate_ollama(prompt, system_prompt, _req, force_tool)
 
         self.llm_logger.info(f"RESPONSE:\n{response}")
         self.llm_logger.info("=" * 60)
         
         return response
 
-    def _generate_openai(self, prompt: str, system_prompt: str, _req) -> str:
+    def _generate_openai(self, prompt: str, system_prompt: str, _req, force_tool: str = None) -> str:
         """Generate via OpenAI-compatible /v1/chat/completions (LM Studio, vLLM)."""
         messages = []
         if system_prompt:
@@ -130,6 +133,13 @@ class LLMManager:
             "max_tokens": self.num_predict,
             "stream": False,
         }
+
+        # Add tool_choice if forcing a specific tool
+        if force_tool:
+            payload["tool_choice"] = {
+                "type": "function",
+                "function": {"name": force_tool}
+            }
 
         logger = logging.getLogger("coding-agent")
 
@@ -152,8 +162,16 @@ class LLMManager:
             logger.error("OpenAI-compat LLM call failed: %s", e)
             return ""
 
-    def _generate_ollama(self, prompt: str, system_prompt: str, _req) -> str:
-        """Generate via Ollama /api/generate."""
+    def _generate_ollama(self, prompt: str, system_prompt: str, _req, force_tool: str = None) -> str:
+        """Generate via Ollama /api/generate.
+        
+        Note: Ollama doesn't support tool_choice, so we add guidance in the prompt instead.
+        """
+        # For Ollama, we can't force tool_choice, but we can modify the prompt
+        # to strongly encourage the model to call the tool
+        if force_tool:
+            prompt = f"{prompt}\n\nIMPORTANT: You MUST call the {force_tool} tool now. Do not explain. Just call the tool."
+        
         payload = {
             "model": self.model,
             "prompt": prompt,
@@ -191,28 +209,49 @@ class LLMManager:
 
         Uses a simple state-machine parser to correctly handle parentheses
         inside quoted string arguments (e.g. code content with function calls).
+        Only extracts the FIRST tool call found to prevent multiple executions.
         """
-        tool_names = ['file_read', 'file_write', 'bash', 'list_files', 'git_status', 'web_search']
-        tool_calls = []
-
+        tool_names = ['file_read', 'file_write', 'bash', 'list_files', 'grep', 'git_status', 'web_search', 'done']
+        
+        # First check for tool simulation (model describes tool use instead of calling it)
+        # Patterns like: "I will use web_search", "using file_read to..."
+        simulation_patterns = [
+            r'I will use (?:the )?(\w+)',
+            r'using (?:the )?(\w+) to',
+            r'call (?:the )?(\w+)',
+            r'execute (?:the )?(\w+)',
+        ]
+        
+        # Check for JSON-style tool calls in text
+        import re
+        json_patterns = [
+            r'\{["\']tool["\']:\s*["\'](\w+)["\']',
+            r'\{["\']name["\']:\s*["\'](\w+)["\']',
+        ]
+        
+        # Find FIRST occurrence of any tool call
+        earliest_pos = len(text)
+        earliest_call = None
+        
         for tool_name in tool_names:
-            # Find all occurrences of this tool name followed by (
-            idx = 0
-            while True:
-                pos = text.find(tool_name + '(', idx)
-                if pos == -1:
-                    break
-
-                # Parse from the opening ( to find the matching )
+            # Look for tool_name(
+            pos = text.find(tool_name + '(')
+            if pos != -1 and pos < earliest_pos:
                 start = pos + len(tool_name)
                 call_str = self._parse_balanced_parens(text, start)
                 if call_str is not None:
-                    full_call = tool_name + call_str
-                    tool_calls.append(full_call)
-
-                idx = pos + 1
-
-        return tool_calls
+                    earliest_call = tool_name + call_str
+                    earliest_pos = pos
+        
+        if earliest_call:
+            return [earliest_call]
+        
+        # Check for done signal in text
+        text_lower = text.lower()
+        if any(word in text_lower for word in ['done', 'complete', 'finished', 'all changes', 'task complete', 'all done']):
+            return ['done(message="Task completed")']
+        
+        return []
 
     @staticmethod
     def _parse_balanced_parens(text: str, start: int) -> Optional[str]:

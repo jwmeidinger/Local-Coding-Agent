@@ -59,21 +59,84 @@ class CheckpointManager:
 
 
 class FileReadTool:
-    """Read file contents."""
+    """Read file contents with line numbers and optional range selection."""
     name = "file_read"
-    description = "Read contents of a file"
+    description = "Read contents of a file (supports optional start_line/end_line to read specific sections)"
+
+    # Only truncate truly enormous files (generated code, minified bundles, etc.)
+    HARD_MAX_LINES = 800
+
+    schema = {
+        "name": "file_read",
+        "description": "Read the contents of a file. For large files, use start_line/end_line to read specific sections.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to read"
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "First line to read (1-based). Omit to start from beginning."
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "Last line to read (1-based, inclusive). Omit to read to end."
+                }
+            },
+            "required": ["path"]
+        }
+    }
     
     def __init__(self, cwd: Path = None):
         self.cwd = cwd or Path(".")
     
-    def execute(self, path: str) -> str:
+    def execute(self, path: str, start_line: str = None, end_line: str = None) -> str:
         try:
             file_path = Path(path)
             if not file_path.is_absolute():
                 file_path = self.cwd / file_path
             if not file_path.exists():
                 return f"Error: File '{path}' not found. Use list_files to explore the directory structure first. The cwd is: {self.cwd}"
-            return file_path.read_text(encoding="utf-8")
+            
+            content = file_path.read_text(encoding="utf-8")
+            lines = content.splitlines()
+            total_lines = len(lines)
+            
+            sl = int(start_line) if start_line else None
+            el = int(end_line) if end_line else None
+            
+            # Line-range request — always return exactly what was asked for
+            if sl or el:
+                s = max((sl or 1) - 1, 0)
+                e = min(el or total_lines, total_lines)
+                selected = lines[s:e]
+                numbered = [f"{s + i + 1}| {l}" for i, l in enumerate(selected)]
+                return f"[{path} lines {s+1}-{e} of {total_lines}]\n" + "\n".join(numbered)
+            
+            # Full-file read — return complete content for normal-sized files
+            if total_lines <= self.HARD_MAX_LINES:
+                numbered = [f"{i + 1}| {l}" for i, l in enumerate(lines)]
+                return f"[{path} — {total_lines} lines]\n" + "\n".join(numbered)
+            
+            # Truly huge files: show generous head + tail with clear guidance
+            head_n = 300
+            tail_n = 100
+            head = lines[:head_n]
+            tail = lines[-tail_n:]
+            omitted = total_lines - head_n - tail_n
+            
+            head_numbered = [f"{i + 1}| {l}" for i, l in enumerate(head)]
+            tail_start = total_lines - tail_n
+            tail_numbered = [f"{tail_start + i + 1}| {l}" for i, l in enumerate(tail)]
+            
+            return (
+                f"[{path} — {total_lines} lines, showing lines 1-{head_n} and {tail_start+1}-{total_lines}]\n"
+                + "\n".join(head_numbered)
+                + f"\n\n... ({omitted} lines omitted — use start_line/end_line to read lines {head_n+1}-{tail_start}) ...\n\n"
+                + "\n".join(tail_numbered)
+            )
         except Exception as e:
             return f"Error reading file: {e}"
 
@@ -82,6 +145,26 @@ class FileWriteTool:
     """Write content to a file."""
     name = "file_write"
     description = "Write content to a file"
+    
+    # JSON Schema for tool definition
+    schema = {
+        "name": "file_write",
+        "description": "Write content to a file, creating it if it doesn't exist or overwriting if it does",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to write"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Content to write to the file"
+                }
+            },
+            "required": ["path", "content"]
+        }
+    }
     
     def __init__(self, cwd: Path = None, checkpoint_manager: Optional[CheckpointManager] = None):
         self.cwd = cwd or Path(".")
@@ -111,6 +194,22 @@ class BashTool:
     """Execute bash commands."""
     name = "bash"
     description = "Execute bash commands in the repository"
+    
+    # JSON Schema for tool definition
+    schema = {
+        "name": "bash",
+        "description": "Execute a bash command in the repository directory",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The bash command to execute"
+                }
+            },
+            "required": ["command"]
+        }
+    }
     
     DANGEROUS_PATTERNS = [
         r'^\s*sudo\s+apt\s+install',
@@ -203,6 +302,25 @@ class ListFilesTool:
     name = "list_files"
     description = "List files in a directory"
     
+    # JSON Schema for tool definition
+    schema = {
+        "name": "list_files",
+        "description": "List files in a directory matching a glob pattern",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path to list (default: current directory)"
+                },
+                "pattern": {
+                    "type": "string", 
+                    "description": "Glob pattern to match files (default: * for all files)"
+                }
+            }
+        }
+    }
+    
     def __init__(self, cwd: Path = None):
         self.cwd = cwd or Path(".")
     
@@ -219,10 +337,101 @@ class ListFilesTool:
             return f"Error listing files: {e}"
 
 
+class GrepTool:
+    """Search for text patterns in files."""
+    name = "grep"
+    description = "Search for text patterns in files using regex"
+    
+    # JSON Schema for tool definition
+    schema = {
+        "name": "grep",
+        "description": "Search for text patterns in files using regular expressions. Similar to the ripgrep (rg) command.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regular expression pattern to search for"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File or directory path to search in (default: current directory)"
+                },
+                "include": {
+                    "type": "string",
+                    "description": "Glob pattern for files to include (e.g., '*.js', '*.py')"
+                }
+            },
+            "required": ["pattern"]
+        }
+    }
+    
+    def __init__(self, cwd: Path = None):
+        self.cwd = cwd or Path(".")
+    
+    def execute(self, pattern: str, path: str = ".", include: str = None) -> str:
+        import re
+        try:
+            search_path = Path(path)
+            if not search_path.is_absolute():
+                search_path = self.cwd / search_path
+            
+            if not search_path.exists():
+                return f"Error: Path '{path}' not found"
+            
+            results = []
+            
+            # Determine which files to search
+            if search_path.is_file():
+                files_to_search = [search_path]
+            else:
+                files_to_search = []
+                if include:
+                    files_to_search = list(search_path.glob(include))
+                else:
+                    # Search all text files
+                    for ext in ['.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go', '.rs', '.cpp', '.c', '.h', '.rb', '.php', '.json', '.yaml', '.yml', '.md', '.txt']:
+                        files_to_search.extend(search_path.rglob(f'*{ext}'))
+            
+            # Compile regex
+            try:
+                regex = re.compile(pattern)
+            except re.error as e:
+                return f"Error: Invalid regex pattern: {e}"
+            
+            # Search files
+            for file_path in files_to_search[:100]:  # Limit to 100 files
+                try:
+                    content = file_path.read_text(encoding='utf-8', errors='ignore')
+                    for line_num, line in enumerate(content.split('\n'), 1):
+                        if regex.search(line):
+                            results.append(f"{file_path.relative_to(self.cwd)}:{line_num}: {line.rstrip()}")
+                except Exception:
+                    continue
+            
+            if not results:
+                return f"No matches found for pattern: {pattern}"
+            
+            return "\n".join(results[:50])  # Limit results
+        
+        except Exception as e:
+            return f"Error searching: {e}"
+
+
 class GitStatusTool:
     """Check git status."""
     name = "git_status"
     description = "Check current git status"
+    
+    # JSON Schema for tool definition
+    schema = {
+        "name": "git_status",
+        "description": "Check the current git status of the repository",
+        "parameters": {
+            "type": "object",
+            "properties": {}
+        }
+    }
     
     def __init__(self, repo):
         self.repo = repo
@@ -232,6 +441,30 @@ class GitStatusTool:
             return self.repo.git.status()
         except Exception as e:
             return f"Error checking git status: {e}"
+
+
+class DoneTool:
+    """Signal that the task is complete."""
+    name = "done"
+    description = "Signal that all work is done. Call this when you have completed the task."
+    
+    # JSON Schema for tool definition
+    schema = {
+        "name": "done",
+        "description": "Signal that the task is complete. Call this when all work has been finished.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "Optional message describing what was completed"
+                }
+            }
+        }
+    }
+    
+    def execute(self, message: str = "") -> str:
+        return f"DONE: {message if message else 'Task completed successfully'}"
 
 
 class SearchGuard:
@@ -414,6 +647,22 @@ class WebSearchTool:
     name = "web_search"
     description = "Search the web for general information (NOT for code)"
     
+    # JSON Schema for tool definition
+    schema = {
+        "name": "web_search",
+        "description": "Search the web for general information. Use for questions about concepts, documentation, tutorials. NOT for searching code.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query - use natural language questions, NOT code"
+                }
+            },
+            "required": ["query"]
+        }
+    }
+    
     def __init__(self):
         self.guard = SearchGuard()
     
@@ -511,7 +760,9 @@ class ToolRegistry:
         self.tools["file_write"] = FileWriteTool(cwd, checkpoint_manager=checkpoint_manager)
         self.tools["bash"] = BashTool(cwd)
         self.tools["list_files"] = ListFilesTool(cwd)
+        self.tools["grep"] = GrepTool(cwd)
         self.tools["web_search"] = WebSearchTool()
+        self.tools["done"] = DoneTool()
         if repo:
             self.tools["git_status"] = GitStatusTool(repo)
     
@@ -522,6 +773,26 @@ class ToolRegistry:
         return self.tools.get(name)
     
     def list_tools(self) -> str:
+        """List tools with JSON schemas for better LLM understanding."""
+        import json
+        tool_schemas = []
+        
+        for name, tool in self.tools.items():
+            if hasattr(tool, 'schema'):
+                tool_schemas.append(tool.schema)
+            else:
+                # Fallback for tools without schema
+                tool_schemas.append({
+                    "name": name,
+                    "description": getattr(tool, 'description', ''),
+                    "parameters": {"type": "object", "properties": {}}
+                })
+        
+        # Return as formatted JSON for the prompt
+        return "## Tools (JSON Schema)\n\n" + json.dumps(tool_schemas, indent=2)
+    
+    def list_tools_simple(self) -> str:
+        """Simple list of tools with descriptions (fallback)."""
         return "\n".join([f"- {name}: {tool.description}" for name, tool in self.tools.items()])
     
     def execute(self, tool_call: str) -> str:

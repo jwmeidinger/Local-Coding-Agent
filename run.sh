@@ -29,6 +29,9 @@ BRANCH_PREFIX="${BRANCH_PREFIX:-agent/}"
 
 # Agent settings
 MAX_ITERATIONS="${MAX_ITERATIONS:-5}"
+MAX_PROMPT_CHARS="${MAX_PROMPT_CHARS:-40000}"
+MAX_TOOL_RESULT_CHARS="${MAX_TOOL_RESULT_CHARS:-1500}"
+MAX_CONSECUTIVE_ERRORS="${MAX_CONSECUTIVE_ERRORS:-2}"
 VERBOSE="${VERBOSE:-false}"
 
 # Enable verbose mode with -v flag
@@ -135,6 +138,9 @@ CMD=(
   --base-branch "$BASE_BRANCH"
   --branch-prefix "$BRANCH_PREFIX"
   --max-iterations "$MAX_ITERATIONS"
+  --max-prompt-chars "$MAX_PROMPT_CHARS"
+  --max-tool-result-chars "$MAX_TOOL_RESULT_CHARS"
+  --max-consecutive-errors "$MAX_CONSECUTIVE_ERRORS"
 )
 
 if [ -n "${SOURCE_IP:-}" ]; then

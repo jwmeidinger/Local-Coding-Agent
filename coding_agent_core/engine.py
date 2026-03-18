@@ -64,16 +64,13 @@ class ExecutionEngine:
                 summary = self.memory_manager.get_codebase_summary()
                 self.logger.info(f"Codebase memory: {summary}")
                 
-                # If no files indexed, offer to index
-                if "No files indexed" in summary:
-                    self.logger.info("Codebase not indexed yet. Run with --index to index first.")
-                    # Auto-index the codebase
-                    self.logger.info("Auto-indexing codebase...")
-                    self.memory_manager.index_codebase()
-                    summary = self.memory_manager.get_codebase_summary()
-                    self.logger.info(f"Codebase memory after indexing: {summary}")
+                # Always re-index on startup to get fresh data
+                self.logger.info("Re-indexing codebase to get latest files...")
+                self.memory_manager.index_codebase()
+                summary = self.memory_manager.get_codebase_summary()
+                self.logger.info(f"Codebase memory after indexing: {summary}")
             except Exception as e:
-                self.logger.warning(f"Could not get codebase summary: {e}")
+                self.logger.warning(f"Could not get/update codebase summary: {e}")
         
         # Create branch
         branch_name = self._create_branch(task_id)
@@ -255,9 +252,43 @@ Do NOT write code in the plan. Do NOT write essays. Maximum 30 lines."""
         
         return self.llm.generate(prompt, skill.system_prompt)
     
+    @staticmethod
+    def _summarize_result(tool_call: str, result: str, summary_chars: int = 600) -> str:
+        """Create a short summary of a tool result for older history entries.
+
+        For file reads: keeps the header line (path + line count) plus the first
+        and last few lines so the agent remembers the file structure.
+        For other tools: keeps the first ``summary_chars`` characters.
+        """
+        if len(result) <= summary_chars:
+            return result
+
+        lines = result.splitlines()
+
+        if tool_call.startswith("file_read(") and len(lines) > 20:
+            header = lines[0]  # e.g. "[src/app.js — 450 lines]"
+            top = "\n".join(lines[1:11])
+            bottom = "\n".join(lines[-5:])
+            omitted = len(lines) - 16
+            return (
+                f"{header}\n{top}\n"
+                f"  ... ({omitted} lines — already read, use start_line/end_line to revisit) ...\n"
+                f"{bottom}"
+            )
+
+        return result[:summary_chars] + f"\n...(summary, {len(result) - summary_chars} chars omitted)"
+
     def _execute_plan(self, context: TaskContext, skill: Skill) -> bool:
-        """Execute the plan step by step."""
-        # Get relevant code context using vector search
+        """Execute the plan step by step with context management.
+
+        Context strategy:
+        - The MOST RECENT tool result is kept in full so the LLM has complete
+          information about the action it just took.
+        - OLDER results are summarised (file structure + first/last lines) to
+          stay within the model's context budget without losing key information.
+        - Duplicate full-file reads are blocked; the agent is told to use
+          start_line/end_line to revisit specific sections.
+        """
         relevant_files = []
         if self.memory_manager:
             try:
@@ -268,20 +299,21 @@ Do NOT write code in the plan. Do NOT write essays. Maximum 30 lines."""
                 relevant_files = [r['file_path'] for r in results if r['combined_score'] > 0.5]
             except Exception as e:
                 self.logger.warning(f"Could not search codebase: {e}")
-        
+
         memory_context = ""
         if relevant_files:
             memory_context = f"""Most Relevant Files:
 {chr(10).join([f"  - {f}" for f in relevant_files[:5]])}
 
 """
-        
-        # Truncate plan if it's too long (model returned a huge plan with code)
-        plan_text = context.plan or ""
-        if len(plan_text) > 6000:
-            plan_text = plan_text[:6000] + "\n...(plan truncated)"
 
-        prompt = f"""{context.system_info}
+        plan_text = context.plan or ""
+        if len(plan_text) > 3000:
+            plan_text = plan_text[:3000] + "\n...(plan truncated)"
+
+        tool_list_simple = self.tools.list_tools_simple()
+
+        base_prompt = f"""{context.system_info}
 
 {memory_context}You are a coding agent that executes tasks by calling tools. You MUST call tools to make changes.
 DO NOT just describe what to do. DO NOT write essays. CALL THE TOOLS.
@@ -296,57 +328,95 @@ Plan (summary):
 
 ## Available Tools
 
-{self.tools.list_tools()}
+{tool_list_simple}
 
-## How to Call Tools
+## Tool Calling Format
 
-You MUST output tool calls in EXACTLY this format (one per response):
+Use this format - ONE tool per response:
 
     file_read(path="src/main.py")
-
+    file_read(path="src/main.py", start_line="50", end_line="100")
     file_write(path="src/auth.js", content="const token = process.env.TOKEN;")
-
     bash(command="npm install simple-oauth2 open")
-
     list_files(path="src")
+    done(message="Task completed")
 
 ## CRITICAL RULES
-1. BEFORE reading any file, use list_files to see what files exist in that directory
-2. If a file_read fails with "not found", use list_files to find the correct path
-3. Do NOT guess file paths - explore the directory structure first
-4. Call ONE tool per response
-5. Start by listing files in the repository to understand the structure
-6. Write files with file_write
-7. Run commands with bash
-8. When done, say DONE
+1. BEFORE reading any file, use list_files to see what files exist
+2. If a file_read fails with "not found", use list_files first
+3. Call ONE tool per response only
+4. For large files, use start_line/end_line to read specific sections
+5. Do NOT re-read files you have already read — use start_line/end_line to revisit sections
+6. When all work is done, call done(message="...")
 
-## IMPORTANT
-- Do NOT write long explanations. Just call the tool.
-- Do NOT put tool calls inside markdown code blocks.
-- Output the tool call on its own line.
-
-Begin. First, list the files in the repository:
-list_files(path=".")
+Thought: I need to see what files exist first.
+Action: list_files(path=".")
 """
-        
+
         max_steps = 20
+        summary_chars = getattr(self.config, "max_tool_result_chars", 1500)
+        max_consecutive_errors = getattr(self.config, "max_consecutive_errors", 2)
+
         no_tool_count = 0
+        error_count = 0
+        files_already_read: set[str] = set()
+
+        # Each entry: {"tool_call": str, "result_full": str, "result_summary": str}
+        step_records: list[dict] = []
+        MAX_HISTORY_WINDOW = 10
+
         for step in range(max_steps):
-            # Guard against unbounded prompt growth
-            if len(prompt) > 40000 and not self.config.verbose:
-                prompt = prompt[:8000] + "\n\n...(earlier steps omitted)...\n\n" + prompt[-8000:]
+            # --- Build prompt: base + summarised older steps + full recent step ---
+            window = step_records[-MAX_HISTORY_WINDOW:]
+            history_parts = []
+
+            if len(step_records) > MAX_HISTORY_WINDOW:
+                history_parts.append(
+                    f"({len(step_records) - MAX_HISTORY_WINDOW} earlier steps omitted)\n"
+                )
+
+            for idx, rec in enumerate(window):
+                is_latest = (idx == len(window) - 1)
+                result_text = rec["result_full"] if is_latest else rec["result_summary"]
+                history_parts.append(
+                    f"\nExecuted: {rec['tool_call']}\nResult:\n{result_text}\n"
+                )
+
+            if history_parts:
+                history_parts.append("Call the next tool (or call done() if finished):")
+
+            prompt = base_prompt + "\n" + "\n".join(history_parts)
 
             response = self.llm.generate(prompt, skill.system_prompt)
+
+            # Handle LLM failure (empty response = timeout or error)
+            if not response or not response.strip():
+                error_count += 1
+                self.logger.warning(
+                    "LLM returned empty response (%d/%d consecutive errors)",
+                    error_count, max_consecutive_errors,
+                )
+                if error_count >= max_consecutive_errors:
+                    self.logger.error(
+                        "Aborting execution: %d consecutive LLM failures (likely timeout). "
+                        "Try reducing task complexity or increasing the LLM timeout.",
+                        error_count,
+                    )
+                    return False
+                # Trim history aggressively on error to shrink context for retry
+                step_records = step_records[-3:]
+                continue
+
+            error_count = 0
+
             if self.config.verbose:
                 context.execution_log.append(f"Step {step + 1}:\n{response}")
             else:
                 context.execution_log.append(f"Step {step + 1}: {response[:200]}...")
-            
-            # Extract and execute tool calls
+
             tool_calls = self.llm.extract_tool_calls(response)
-            
+
             if not tool_calls:
-                # No tool calls - check if task is complete
                 if any(word in response.lower() for word in ["done", "complete", "finished", "all changes"]):
                     return True
 
@@ -355,34 +425,60 @@ list_files(path=".")
                     self.logger.warning("Model not producing tool calls after %d attempts", no_tool_count)
                     return True
 
-                # Nudge the model to call a tool
-                prompt += f"\n\nYou MUST call a tool now. Do not explain. Output ONLY the tool call. Example:\nlist_files(path=\".\")\nCall a tool now:"
+                step_records.append({
+                    "tool_call": "(no tool called)",
+                    "result_full": "You MUST call a tool now. Do not explain. Output ONLY the tool call.\nExample: list_files(path=\".\")",
+                    "result_summary": "You MUST call a tool now.",
+                })
             else:
                 no_tool_count = 0
                 tool_call = tool_calls[0]
                 self.logger.info(f"Executing: {tool_call}")
+
+                if tool_call.startswith('done('):
+                    self.logger.info("Task completed - done tool called")
+                    return True
+
+                # Deduplicate full-file reads (line-range re-reads are allowed)
+                if tool_call.startswith('file_read('):
+                    path_match = re.search(r'path\s*=\s*["\']([^"\']+)["\']', tool_call)
+                    has_range = re.search(r'(start_line|end_line)\s*=', tool_call)
+                    if path_match and not has_range:
+                        read_path = path_match.group(1)
+                        if read_path in files_already_read:
+                            msg = (
+                                f"You already read {read_path}. The content is in your earlier context. "
+                                f"Use start_line/end_line to revisit specific sections."
+                            )
+                            step_records.append({
+                                "tool_call": tool_call,
+                                "result_full": msg,
+                                "result_summary": msg,
+                            })
+                            self.logger.info(f"Skipped duplicate read of {read_path}")
+                            continue
+                        files_already_read.add(read_path)
+
                 result = self.tools.execute(tool_call)
-                
-                # Log full result in verbose mode
+
                 if self.config.verbose:
                     self.logger.info(f"Result:\n{result}")
                 else:
                     self.logger.info(f"Result: {result[:200]}...")
-                
-                # If file not found, add explicit guidance
+
                 if "not found" in result.lower():
                     result += "\n\nIMPORTANT: Use list_files to find the correct path before trying file_read again."
-                
-                if self.config.verbose:
-                    prompt += f"\n\nExecuted: {tool_call}\nResult:\n{result}\n\nCall the next tool (or say DONE if finished):"
-                else:
-                    prompt += f"\n\nExecuted: {tool_call}\nResult:\n{result[:2000]}\n\nCall the next tool (or say DONE if finished):"
-        
+
+                step_records.append({
+                    "tool_call": tool_call,
+                    "result_full": result,
+                    "result_summary": self._summarize_result(tool_call, result, summary_chars),
+                })
+
         return True
     
     def _review_changes(self, context: TaskContext, skill: Skill) -> str:
         """Review the changes made."""
-        # Get git diff
         try:
             diff = self.repo.git.diff()
             status = self.repo.git.status()
@@ -390,8 +486,13 @@ list_files(path=".")
             diff = "Could not get diff"
             status = "Could not get status"
         
-        # Don't truncate diff in verbose mode
-        diff_to_send = diff if self.config.verbose else diff[:4000]
+        max_diff = 4000 if not self.config.verbose else 12000
+        diff_to_send = diff if len(diff) <= max_diff else (
+            diff[:max_diff] + f"\n...(diff truncated, {len(diff) - max_diff} chars omitted)"
+        )
+        
+        recent_log = context.execution_log[-3:]
+        log_text = "\n".join(entry[:300] for entry in recent_log)
         
         prompt = f"""Review the changes made for this task:
 
@@ -403,8 +504,8 @@ Git Status:
 Changes (diff):
 {diff_to_send}
 
-Execution log:
-{"\n".join(context.execution_log[-5:])}
+Recent steps:
+{log_text}
 
 {skill.review_prompt}
 """
