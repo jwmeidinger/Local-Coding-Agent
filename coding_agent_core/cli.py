@@ -68,11 +68,11 @@ Examples:
     
     parser.add_argument("--max-iterations", type=int, default=5,
                         help="Max execution iterations per task")
-    parser.add_argument("--max-prompt-chars", type=int, default=40000,
-                        help="Max characters sent to LLM per request (~10k tokens). "
-                             "Lower this if your model has a small context window. (default: 40000)")
-    parser.add_argument("--max-tool-result-chars", type=int, default=1500,
-                        help="Max characters kept per tool result in context (default: 1500)")
+    parser.add_argument("--max-prompt-chars", type=int, default=80000,
+                        help="Max characters sent to LLM per request (~20k tokens). "
+                             "Lower this if your model has a small context window. (default: 80000)")
+    parser.add_argument("--max-tool-result-chars", type=int, default=3000,
+                        help="Max characters kept per tool result in older history entries (default: 3000)")
     parser.add_argument("--max-consecutive-errors", type=int, default=2,
                         help="Abort after N consecutive LLM failures/timeouts (default: 2)")
     parser.add_argument("--no-commit", action="store_true",

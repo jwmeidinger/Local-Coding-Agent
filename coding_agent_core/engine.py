@@ -108,10 +108,27 @@ class ExecutionEngine:
                 self.logger.warning(f"Execution failed on iteration {iteration}")
                 continue
             
+            # Skip review if nothing was written — go straight to next iteration
+            if not self._has_changes():
+                self.logger.warning(
+                    "Iteration %d produced no file changes — skipping review, retrying",
+                    iteration,
+                )
+                context.review_feedback = (
+                    "CRITICAL: The previous iteration read files but never called "
+                    "file_write. You MUST write code this iteration. Do NOT just read "
+                    "files again. Use the information you already gathered to make the "
+                    "changes immediately."
+                )
+                if iteration >= self.config.max_iterations:
+                    self.logger.warning("Max iterations reached without any file changes")
+                    break
+                continue
+            
             # Review
             review_result = self._review_changes(context, skill)
             
-            if "PASS" in review_result.upper():
+            if self._review_passed(review_result):
                 self.logger.info("Task passed review")
                 break
             else:
@@ -359,11 +376,17 @@ Action: list_files(path=".")
 
         no_tool_count = 0
         error_count = 0
+        write_count = 0
         files_already_read: set[str] = set()
 
         # Each entry: {"tool_call": str, "result_full": str, "result_summary": str}
         step_records: list[dict] = []
         MAX_HISTORY_WINDOW = 10
+
+        # Step budget thresholds for escalating write nudges
+        NUDGE_SOFT = int(max_steps * 0.5)    # 50% — gentle reminder
+        NUDGE_HARD = int(max_steps * 0.75)   # 75% — strong warning
+        NUDGE_FINAL = int(max_steps * 0.9)   # 90% — last chance
 
         for step in range(max_steps):
             # --- Build prompt: base + summarised older steps + full recent step ---
@@ -384,6 +407,27 @@ Action: list_files(path=".")
 
             if history_parts:
                 history_parts.append("Call the next tool (or call done() if finished):")
+
+            # Escalating nudges when the agent is only reading
+            if write_count == 0 and step >= NUDGE_SOFT:
+                remaining = max_steps - step
+                if step >= NUDGE_FINAL:
+                    history_parts.append(
+                        f"\n** FINAL WARNING: You have {remaining} steps left and have "
+                        f"NOT written any code yet. Call file_write NOW with the changes "
+                        f"or the task will fail. Do NOT read any more files. **"
+                    )
+                elif step >= NUDGE_HARD:
+                    history_parts.append(
+                        f"\n** WARNING: You have used {step}/{max_steps} steps reading "
+                        f"files but have NOT called file_write yet. You MUST start "
+                        f"writing code NOW. You have enough information. **"
+                    )
+                else:
+                    history_parts.append(
+                        f"\nNote: You have used {step} of {max_steps} steps. "
+                        f"Start making changes with file_write soon."
+                    )
 
             prompt = base_prompt + "\n" + "\n".join(history_parts)
 
@@ -459,6 +503,9 @@ Action: list_files(path=".")
                             continue
                         files_already_read.add(read_path)
 
+                if tool_call.startswith('file_write('):
+                    write_count += 1
+
                 result = self.tools.execute(tool_call)
 
                 if self.config.verbose:
@@ -474,6 +521,14 @@ Action: list_files(path=".")
                     "result_full": result,
                     "result_summary": self._summarize_result(tool_call, result, summary_chars),
                 })
+
+        if write_count == 0:
+            self.logger.warning(
+                "Execution used all %d steps without calling file_write "
+                "(read-loop detected: %d files read). The model investigated "
+                "but never wrote code.",
+                max_steps, len(files_already_read),
+            )
 
         return True
     
@@ -512,6 +567,24 @@ Recent steps:
         
         return self.llm.generate(prompt, skill.system_prompt)
     
+    @staticmethod
+    def _review_passed(review_result: str) -> bool:
+        """Check whether the review status is PASS.
+
+        Uses a precise regex so that incidental uses of the word "pass" in
+        prose (e.g. "pass data to the handler") don't trigger a false positive.
+        """
+        if not review_result:
+            return False
+        # Match "STATUS: PASS" (with optional brackets/stars/whitespace)
+        # but NOT "STATUS: PASS_WITH_SUGGESTIONS" or "STATUS: NEEDS_WORK"
+        return bool(re.search(
+            r'STATUS\s*:\s*\[?\s*\*{0,2}\s*PASS\s*\*{0,2}\s*\]?'
+            r'(?:\s|$|[^A-Z_])',
+            review_result,
+            re.IGNORECASE | re.MULTILINE,
+        ))
+
     def _has_changes(self) -> bool:
         """Check if there are uncommitted changes."""
         return self.repo.is_dirty(untracked_files=True)
