@@ -102,8 +102,8 @@ class LLMManager:
         self.llm_logger.info(f"MODEL: {self.model}")
         self.llm_logger.info(f"TEMP: {self.temperature}")
         if system_prompt:
-            self.llm_logger.info(f"SYSTEM PROMPT:\n{system_prompt[:500]}...")
-        self.llm_logger.info(f"USER PROMPT:\n{prompt[:1000]}...")
+            self.llm_logger.info(f"SYSTEM PROMPT:\n{system_prompt}")
+        self.llm_logger.info(f"USER PROMPT:\n{prompt}")
         self.llm_logger.info("-" * 60)
 
         if self.server_type == "openai":
@@ -111,7 +111,7 @@ class LLMManager:
         else:
             response = self._generate_ollama(prompt, system_prompt, _req)
 
-        self.llm_logger.info(f"RESPONSE:\n{response[:1500]}...")
+        self.llm_logger.info(f"RESPONSE:\n{response}")
         self.llm_logger.info("=" * 60)
         
         return response

@@ -119,7 +119,10 @@ class ExecutionEngine:
                 break
             else:
                 context.review_feedback = review_result
-                self.logger.info(f"Review feedback: {review_result[:200]}...")
+                if self.config.verbose:
+                    self.logger.info(f"Review feedback:\n{review_result}")
+                else:
+                    self.logger.info(f"Review feedback: {review_result[:200]}...")
                 if iteration >= self.config.max_iterations:
                     self.logger.warning("Max iterations reached without PASS")
                     break
@@ -330,11 +333,14 @@ list_files(path=".")
         no_tool_count = 0
         for step in range(max_steps):
             # Guard against unbounded prompt growth
-            if len(prompt) > 40000:
+            if len(prompt) > 40000 and not self.config.verbose:
                 prompt = prompt[:8000] + "\n\n...(earlier steps omitted)...\n\n" + prompt[-8000:]
 
             response = self.llm.generate(prompt, skill.system_prompt)
-            context.execution_log.append(f"Step {step + 1}: {response[:200]}...")
+            if self.config.verbose:
+                context.execution_log.append(f"Step {step + 1}:\n{response}")
+            else:
+                context.execution_log.append(f"Step {step + 1}: {response[:200]}...")
             
             # Extract and execute tool calls
             tool_calls = self.llm.extract_tool_calls(response)
@@ -356,13 +362,21 @@ list_files(path=".")
                 tool_call = tool_calls[0]
                 self.logger.info(f"Executing: {tool_call}")
                 result = self.tools.execute(tool_call)
-                self.logger.info(f"Result: {result[:200]}...")
+                
+                # Log full result in verbose mode
+                if self.config.verbose:
+                    self.logger.info(f"Result:\n{result}")
+                else:
+                    self.logger.info(f"Result: {result[:200]}...")
                 
                 # If file not found, add explicit guidance
                 if "not found" in result.lower():
                     result += "\n\nIMPORTANT: Use list_files to find the correct path before trying file_read again."
                 
-                prompt += f"\n\nExecuted: {tool_call}\nResult:\n{result[:2000]}\n\nCall the next tool (or say DONE if finished):"
+                if self.config.verbose:
+                    prompt += f"\n\nExecuted: {tool_call}\nResult:\n{result}\n\nCall the next tool (or say DONE if finished):"
+                else:
+                    prompt += f"\n\nExecuted: {tool_call}\nResult:\n{result[:2000]}\n\nCall the next tool (or say DONE if finished):"
         
         return True
     
@@ -376,6 +390,9 @@ list_files(path=".")
             diff = "Could not get diff"
             status = "Could not get status"
         
+        # Don't truncate diff in verbose mode
+        diff_to_send = diff if self.config.verbose else diff[:4000]
+        
         prompt = f"""Review the changes made for this task:
 
 Task: {context.task_description}
@@ -384,7 +401,7 @@ Git Status:
 {status}
 
 Changes (diff):
-{diff[:4000]}
+{diff_to_send}
 
 Execution log:
 {"\n".join(context.execution_log[-5:])}
