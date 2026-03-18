@@ -25,7 +25,7 @@ class AgentConfig:
     llm_url: str = "http://localhost:11434"
     model: str = "codellama"
     temperature: float = 0.1
-    num_predict: int = 4096
+    num_predict: int = 8192
     source_ip: str = ""  # Bind to specific local IP to bypass VPNs
     
     # Execution settings

@@ -75,8 +75,8 @@ class LLMManager:
 
     # Maximum characters to send to the LLM (rough estimate: ~4 chars per token).
     # Adjust this based on your model's context window size.
-    # 50k tokens ≈ 150k chars; leave room for the response.
-    MAX_PROMPT_CHARS = 100000
+    # 50k tokens ≈ 200k chars; leave room for the response.
+    MAX_PROMPT_CHARS = 180000
 
     def generate(self, prompt: str, system_prompt: str = "") -> str:
         """Generate text using the LLM, with automatic prompt truncation."""
