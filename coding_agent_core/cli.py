@@ -77,6 +77,10 @@ Examples:
                         help="Abort after N consecutive LLM failures/timeouts (default: 2)")
     parser.add_argument("--no-commit", action="store_true",
                         help="Don't auto-commit changes")
+    parser.add_argument("--build-command", type=str, default="",
+                        help="Build/check command to run after every file edit (e.g. 'npm run build', 'tsc --noEmit', 'python -m py_compile')")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="Disable auto-verification after file writes")
     
     parser.add_argument("--list-skills", action="store_true",
                         help="List available skills and exit")
@@ -204,4 +208,6 @@ Examples:
         max_consecutive_errors=args.max_consecutive_errors,
         auto_commit=not args.no_commit,
         verbose=args.verbose,
+        build_command=args.build_command,
+        verify_after_write=not args.no_verify,
     )

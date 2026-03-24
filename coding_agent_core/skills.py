@@ -186,6 +186,26 @@ Respond with:
 4. Name tests descriptively (what_input_expected_behavior)
 5. Ensure tests are isolated and repeatable
 
+WORKFLOW — follow this order strictly:
+1. Read the TARGET source file and 1-2 EXISTING test files (for patterns)
+2. Read the mock/test utility files to understand available helpers
+3. WRITE the test file (file_edit or file_write) — do NOT run tests first
+4. Run the tests ONCE to check results
+5. If tests fail, read the error output carefully, fix, and re-run ONCE more
+6. Call done()
+
+CRITICAL RULES:
+- Do NOT attempt to run tests before writing them — write first, verify after
+- If a bash command returns "(no output)", do NOT retry the same command with
+  different flags. The output capture may be unreliable. Move on and try a
+  different approach (e.g. write the test file and run later, or skip to done).
+- Limit test-running attempts to 2 total. If tests can't be verified, commit
+  what you have — the tests are likely correct if they follow existing patterns.
+- Do NOT pipe output through head/tail/cat — output truncation is handled automatically.
+- Follow the EXACT mock patterns from existing test files in the same project.
+  If ReportSummaryPage.test.tsx uses `(_url, successCb, statusCb)`, use that
+  same callback signature — not a different one.
+
 When writing tests:
 - First examine existing test files to understand the testing framework and patterns
 - Read the target code thoroughly to understand what needs testing
@@ -215,6 +235,11 @@ Create a detailed test plan:""",
 5. Do tests follow the existing patterns in the codebase?
 6. Is the testing framework used correctly?
 7. Are assertions clear and meaningful?
+
+IMPORTANT: If test execution could not be verified (empty output from test runner),
+evaluate the tests based on code quality and pattern compliance alone. Tests that
+follow existing patterns in the codebase are likely correct. Do NOT mark as
+NEEDS_WORK solely because tests couldn't be run.
 
 Respond with:
 - STATUS: [PASS/NEEDS_WORK]

@@ -34,6 +34,10 @@ MAX_TOOL_RESULT_CHARS="${MAX_TOOL_RESULT_CHARS:-3000}"
 MAX_CONSECUTIVE_ERRORS="${MAX_CONSECUTIVE_ERRORS:-2}"
 VERBOSE="${VERBOSE:-false}"
 
+# Build verification
+BUILD_COMMAND="${BUILD_COMMAND:-}"        # e.g. "pnpm run typecheck", "tsc --noEmit", "make check"
+NO_VERIFY="${NO_VERIFY:-false}"          # Set to "true" to disable auto-verify after edits
+
 # Enable verbose mode with -v flag
 if [ "${1:-}" = "-v" ] || [ "${1:-}" = "--verbose" ]; then
   VERBOSE="true"
@@ -52,9 +56,7 @@ if [ -n "${PYTHON_BIN:-}" ]; then
   PYTHON="$PYTHON_BIN"
 elif [ -x "$(dirname "$0")/.venv/bin/python" ]; then
   PYTHON="$(dirname "$0")/.venv/bin/python"
-elif command -v python3 >/dev/null 2>&1; then
-  PYTHON="python3"
-else
+elif command -v python >/dev/null 2>&1; then
   PYTHON="python"
 fi
 
@@ -147,6 +149,14 @@ if [ -n "${SOURCE_IP:-}" ]; then
   CMD+=(--source-ip "$SOURCE_IP")
 fi
 
+if [ -n "${BUILD_COMMAND:-}" ]; then
+  CMD+=(--build-command "$BUILD_COMMAND")
+fi
+
+if [ "$NO_VERIFY" = "true" ]; then
+  CMD+=(--no-verify)
+fi
+
 if [ "$VERBOSE" = "true" ]; then
   CMD+=(--verbose)
 fi
@@ -161,6 +171,8 @@ echo "Starting Coding Agent..."
 echo "Repository: $REPO_PATH"
 echo "Model: $MODEL"
 [ -n "${SOURCE_IP:-}" ] && echo "Source IP: $SOURCE_IP"
+[ -n "${BUILD_COMMAND:-}" ] && echo "Build command: $BUILD_COMMAND"
+[ "$NO_VERIFY" = "true" ] && echo "Auto-verify: DISABLED"
 [ "$VERBOSE" = "true" ] && echo "Verbose mode: ENABLED"
 echo ""
 echo "Log files:"

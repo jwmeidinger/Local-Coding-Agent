@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .config import AgentConfig, SystemContext, TaskContext
 from .deps import GitCommandError, VECTOR_MEMORY_AVAILABLE, VectorMemoryManager
-from .llm import LLMManager
+from .llm import ChatResponse, LLMManager, ToolCall
 from .skills import Skill, SkillRegistry
 from .tools import SystemUpgradeGuard, ToolRegistry
 
@@ -46,7 +46,208 @@ class ExecutionEngine:
         
         self.modified_files = []
         self.current_branch = None
+
+        # Suggest build command if not configured
+        if not config.build_command:
+            self._suggest_build_command()
     
+    def _suggest_build_command(self) -> None:
+        """Detect build/check commands from project config files and log suggestions."""
+        import json as _json
+
+        candidates = []
+        pkg_manager = "npm run"
+
+        # Detect package manager
+        if (self.repo_path / "pnpm-lock.yaml").exists():
+            pkg_manager = "pnpm run"
+        elif (self.repo_path / "yarn.lock").exists():
+            pkg_manager = "yarn"
+        elif (self.repo_path / "bun.lockb").exists():
+            pkg_manager = "bun run"
+
+        # Check package.json scripts
+        pkg_json = self.repo_path / "package.json"
+        if pkg_json.exists():
+            try:
+                data = _json.loads(pkg_json.read_text(encoding="utf-8"))
+                scripts = data.get("scripts", {})
+                # Prefer fast check-only commands over full builds
+                preferred = ["typecheck", "check", "lint", "tsc", "build:check"]
+                for name in preferred:
+                    if name in scripts:
+                        candidates.append((f"{pkg_manager} {name}", f'package.json "{name}"'))
+                if "build" in scripts:
+                    candidates.append((f"{pkg_manager} build", 'package.json "build"'))
+            except Exception:
+                pass
+
+        # Check for tsconfig — only suggest if no package.json scripts found
+        # NEVER suggest raw `npx tsc` — it has PATH issues on Windows.
+        # Always prefer the package manager's script runner.
+        if not candidates:
+            if (self.repo_path / "tsconfig.json").exists() or (self.repo_path / "tsconfig.electron.json").exists():
+                candidates.append((f"{pkg_manager} build", "tsconfig.json detected (add a 'build' script to package.json)"))
+
+        # Check Makefile
+        makefile = self.repo_path / "Makefile"
+        if makefile.exists():
+            try:
+                content = makefile.read_text(encoding="utf-8", errors="ignore")
+                for target in ["check", "lint", "typecheck", "build"]:
+                    if f"\n{target}:" in content or content.startswith(f"{target}:"):
+                        candidates.append((f"make {target}", f'Makefile "{target}" target'))
+            except Exception:
+                pass
+
+        # Check pyproject.toml / setup.cfg
+        if (self.repo_path / "pyproject.toml").exists():
+            candidates.append(("python -m py_compile", "pyproject.toml detected"))
+            if (self.repo_path / "mypy.ini").exists() or (self.repo_path / ".mypy.ini").exists():
+                candidates.append(("mypy .", "mypy config detected"))
+
+        # Check Cargo.toml (Rust)
+        if (self.repo_path / "Cargo.toml").exists():
+            candidates.append(("cargo check", "Cargo.toml detected"))
+
+        # Check go.mod (Go)
+        if (self.repo_path / "go.mod").exists():
+            candidates.append(("go build ./...", "go.mod detected"))
+
+        if candidates:
+            self.logger.info("No --build-command set. Detected candidates:")
+            for cmd, source in candidates:
+                self.logger.info(f"  {cmd}  (from {source})")
+            best = candidates[0][0]
+            self.logger.info(f'Pass --build-command="{best}" to enable auto-verify after edits')
+
+    def _get_project_summary(self) -> str:
+        """Read key project config files and return a brief summary for context.
+
+        This saves the agent 2-3 file_read steps by front-loading information
+        it almost always needs: available scripts, language/framework, entry points.
+        """
+        import json as _json
+        sections = []
+
+        # --- package.json ---
+        pkg_json = self.repo_path / "package.json"
+        if pkg_json.exists():
+            try:
+                data = _json.loads(pkg_json.read_text(encoding="utf-8"))
+                parts = []
+                if data.get("name"):
+                    parts.append(f"Name: {data['name']}")
+                if data.get("version"):
+                    parts.append(f"Version: {data['version']}")
+
+                # Scripts (very useful for the agent to know)
+                scripts = data.get("scripts", {})
+                if scripts:
+                    script_list = ", ".join(f'"{k}"' for k in scripts.keys())
+                    parts.append(f"Scripts: {script_list}")
+
+                # Main entry point
+                for key in ("main", "module", "entry"):
+                    if data.get(key):
+                        parts.append(f"Entry: {data[key]}")
+                        break
+
+                # Key dependencies (just names, not versions)
+                deps = list(data.get("dependencies", {}).keys())
+                if deps:
+                    shown = deps[:10]
+                    dep_str = ", ".join(shown)
+                    if len(deps) > 10:
+                        dep_str += f" (+{len(deps) - 10} more)"
+                    parts.append(f"Dependencies: {dep_str}")
+
+                dev_deps = list(data.get("devDependencies", {}).keys())
+                frameworks = [d for d in dev_deps if d in (
+                    "typescript", "react", "vue", "svelte", "angular",
+                    "next", "nuxt", "electron", "jest", "vitest", "mocha",
+                    "eslint", "prettier", "webpack", "vite", "rollup", "esbuild",
+                )]
+                if frameworks:
+                    parts.append(f"Dev tools: {', '.join(frameworks)}")
+
+                if parts:
+                    sections.append("## package.json\n" + "\n".join(f"- {p}" for p in parts))
+            except Exception:
+                pass
+
+        # --- tsconfig.json ---
+        for tsconfig_name in ("tsconfig.json", "tsconfig.electron.json", "tsconfig.app.json"):
+            tsconfig = self.repo_path / tsconfig_name
+            if tsconfig.exists():
+                try:
+                    # tsconfig can have comments, so just extract key bits
+                    content = tsconfig.read_text(encoding="utf-8")
+                    parts = [f"TypeScript config: {tsconfig_name}"]
+                    if '"outDir"' in content:
+                        import re
+                        m = re.search(r'"outDir"\s*:\s*"([^"]+)"', content)
+                        if m:
+                            parts.append(f"Output: {m.group(1)}")
+                    if '"strict": true' in content:
+                        parts.append("Strict mode enabled")
+                    sections.append("## TypeScript\n" + "\n".join(f"- {p}" for p in parts))
+                except Exception:
+                    pass
+                break  # Only show one tsconfig
+
+        # --- Makefile ---
+        makefile = self.repo_path / "Makefile"
+        if makefile.exists():
+            try:
+                content = makefile.read_text(encoding="utf-8", errors="ignore")
+                targets = []
+                for line in content.split('\n'):
+                    if line and not line.startswith('\t') and not line.startswith('#') and ':' in line:
+                        target = line.split(':')[0].strip()
+                        if target and not target.startswith('.'):
+                            targets.append(target)
+                if targets:
+                    sections.append(f"## Makefile\n- Targets: {', '.join(targets[:15])}")
+            except Exception:
+                pass
+
+        # --- pyproject.toml ---
+        pyproject = self.repo_path / "pyproject.toml"
+        if pyproject.exists():
+            try:
+                content = pyproject.read_text(encoding="utf-8")
+                parts = ["Python project (pyproject.toml)"]
+                if "pytest" in content:
+                    parts.append("Testing: pytest")
+                if "mypy" in content:
+                    parts.append("Type checking: mypy")
+                if "ruff" in content or "flake8" in content:
+                    parts.append("Linting: " + ("ruff" if "ruff" in content else "flake8"))
+                sections.append("## Python\n" + "\n".join(f"- {p}" for p in parts))
+            except Exception:
+                pass
+
+        # --- requirements.txt ---
+        req_txt = self.repo_path / "requirements.txt"
+        if req_txt.exists() and not pyproject.exists():
+            try:
+                lines = [l.strip().split("==")[0].split(">=")[0] for l in
+                         req_txt.read_text(encoding="utf-8").splitlines()
+                         if l.strip() and not l.startswith("#")]
+                if lines:
+                    shown = lines[:10]
+                    dep_str = ", ".join(shown)
+                    if len(lines) > 10:
+                        dep_str += f" (+{len(lines) - 10} more)"
+                    sections.append(f"## requirements.txt\n- Packages: {dep_str}")
+            except Exception:
+                pass
+
+        if sections:
+            return "\n## Project Context (auto-detected)\n" + "\n\n".join(sections) + "\n"
+        return ""
+
     def execute_task(self, task_description: str, task_id: str, repo_path: Path = None) -> bool:
         """Execute a single task from start to finish."""
         self.logger.info(f"Starting execution of task: {task_id}")
@@ -116,9 +317,9 @@ class ExecutionEngine:
                 )
                 context.review_feedback = (
                     "CRITICAL: The previous iteration read files but never called "
-                    "file_write. You MUST write code this iteration. Do NOT just read "
+                    "file_edit or file_write. You MUST write code this iteration. Do NOT just read "
                     "files again. Use the information you already gathered to make the "
-                    "changes immediately."
+                    "changes immediately with file_edit."
                 )
                 if iteration >= self.config.max_iterations:
                     self.logger.warning("Max iterations reached without any file changes")
@@ -232,20 +433,26 @@ class ExecutionEngine:
             raise RuntimeError(f"Failed to create branch: {e}") from e
     
     def _create_plan(self, context: TaskContext, skill: Skill) -> str:
-        """Create an execution plan."""
-        # Build prompt with codebase context using vector search
+        """Create an execution plan grounded in the actual file tree.
+
+        Runs file_tree first so the LLM cannot hallucinate filenames.
+        """
+        # Always get the real file tree so the plan is grounded
+        file_tree = self.tools.execute('file_tree(path=".")')
+        self.logger.info("File tree collected for planning phase")
+
+        # Optionally enrich with vector search results
         context_info = ""
         if self.memory_manager:
             try:
-                # Search for relevant code files using vector + text hybrid search
                 results = self.memory_manager.search_codebase(
                     context.task_description,
                     limit=10
                 )
                 if results:
-                    context_info = "Relevant Code Files Found:\n"
-                    for r in results[:5]:  # Top 5 most relevant
-                        context_info += f"\n  📄 {r['file_path']} (score: {r['combined_score']:.2f})\n"
+                    context_info = "Relevant Code Files (from memory):\n"
+                    for r in results[:5]:
+                        context_info += f"\n  {r['file_path']} (score: {r['combined_score']:.2f})\n"
                         context_info += f"     {r.get('summary') or ''}\n"
                         kf = r.get('key_functions') or []
                         if kf:
@@ -253,20 +460,23 @@ class ExecutionEngine:
                     context_info += "\n"
             except Exception as e:
                 self.logger.warning(f"Vector search failed: {e}")
-        
+
         prompt = f"""{context.system_info}
+
+## Project File Tree (REAL — use only these paths)
+{file_tree}
 
 {context_info}{skill.planning_prompt.format(task_description=context.task_description)}
 
-IMPORTANT: Keep your plan SHORT and ACTIONABLE. List only:
-1. Files to read (to understand existing code)
-2. Files to create or modify (with brief description of changes)
-3. Commands to run (e.g. install dependencies, run tests)
-
-Do NOT write code in the plan. Do NOT write essays. Maximum 30 lines."""
+IMPORTANT RULES:
+- You may ONLY reference files/directories that appear in the file tree above.
+- If the task mentions a file that does NOT exist, say so and adapt.
+- Keep the plan SHORT and ACTIONABLE (max 30 lines).
+- List: (1) files to read, (2) files to create or modify, (3) commands to run.
+- Do NOT write code in the plan."""
         if context.review_feedback:
-            prompt += f"\n\nPrevious feedback to address:\n{context.review_feedback}"
-        
+            prompt += f"\n\nPrevious review feedback to address:\n{context.review_feedback}"
+
         return self.llm.generate(prompt, skill.system_prompt)
     
     @staticmethod
@@ -296,16 +506,19 @@ Do NOT write code in the plan. Do NOT write essays. Maximum 30 lines."""
         return result[:summary_chars] + f"\n...(summary, {len(result) - summary_chars} chars omitted)"
 
     def _execute_plan(self, context: TaskContext, skill: Skill) -> bool:
-        """Execute the plan step by step with context management.
+        """Execute the plan step by step using multi-turn chat with tools.
 
-        Context strategy:
-        - The MOST RECENT tool result is kept in full so the LLM has complete
-          information about the action it just took.
-        - OLDER results are summarised (file structure + first/last lines) to
-          stay within the model's context budget without losing key information.
-        - Duplicate full-file reads are blocked; the agent is told to use
-          start_line/end_line to revisit specific sections.
+        Uses native tool calling when the model supports it, with automatic
+        fallback to text-based extraction when it doesn't.
+
+        Context strategy (multi-turn):
+        - Each tool call and result becomes a real message in the conversation.
+        - Older tool results are summarized to manage context window size.
+        - The LLM sees the full conversation history, not a reconstructed prompt.
         """
+        # --- Collect file tree ONCE at the start ---
+        file_tree = self.tools.execute('file_tree(path=".")')
+
         relevant_files = []
         if self.memory_manager:
             try:
@@ -319,7 +532,7 @@ Do NOT write code in the plan. Do NOT write essays. Maximum 30 lines."""
 
         memory_context = ""
         if relevant_files:
-            memory_context = f"""Most Relevant Files:
+            memory_context = f"""Most Relevant Files (from memory):
 {chr(10).join([f"  - {f}" for f in relevant_files[:5]])}
 
 """
@@ -328,113 +541,99 @@ Do NOT write code in the plan. Do NOT write essays. Maximum 30 lines."""
         if len(plan_text) > 3000:
             plan_text = plan_text[:3000] + "\n...(plan truncated)"
 
-        tool_list_simple = self.tools.list_tools_simple()
+        # --- Build initial messages ---
+        system_message = skill.system_prompt + f"""
 
-        base_prompt = f"""{context.system_info}
-
-{memory_context}You are a coding agent that executes tasks by calling tools. You MUST call tools to make changes.
-DO NOT just describe what to do. DO NOT write essays. CALL THE TOOLS.
+{context.system_info}
 
 You are working in repository: {context.repo_path}
 All file paths are relative to this directory.
 
-Task: {context.task_description}
-
-Plan (summary):
-{plan_text}
-
-## Available Tools
-
-{tool_list_simple}
-
-## Tool Calling Format
-
-Use this format - ONE tool per response:
-
-    file_read(path="src/main.py")
-    file_read(path="src/main.py", start_line="50", end_line="100")
-    file_write(path="src/auth.js", content="const token = process.env.TOKEN;")
-    bash(command="npm install simple-oauth2 open")
-    list_files(path="src")
-    done(message="Task completed")
-
-## CRITICAL RULES
-1. BEFORE reading any file, use list_files to see what files exist
-2. If a file_read fails with "not found", use list_files first
-3. Call ONE tool per response only
-4. For large files, use start_line/end_line to read specific sections
-5. Do NOT re-read files you have already read — use start_line/end_line to revisit sections
-6. When all work is done, call done(message="...")
-
-Thought: I need to see what files exist first.
-Action: list_files(path=".")
+## Rules
+1. Use file_tree output (provided below) instead of repeated list_files calls.
+2. Use file_edit to modify existing files (NOT file_write — file_write is for NEW files only).
+3. If file_edit fails (text not found), re-read the file to get the exact text.
+4. Do NOT invent file paths — only use paths from the file tree.
+5. When all work is done, call git_diff() to review, then done().
+6. FOLLOW EXISTING PATTERNS in the code. If the codebase already handles epic_title/epic_url, use the same pattern for milestone_title/milestone_url. Do NOT web_search for API docs when you can see the pattern in the code you already read.
+7. Limit web_search to 2 calls maximum. If you need API docs, read ONE page. Do not search repeatedly for the same topic.
 """
 
-        max_steps = 20
-        summary_chars = getattr(self.config, "max_tool_result_chars", 1500)
+        # --- Auto-detect project context from config files ---
+        project_summary = self._get_project_summary()
+
+        user_message = f"""{memory_context}## Project File Tree
+{file_tree}
+{project_summary}
+Task: {context.task_description}
+
+Plan:
+{plan_text}
+
+Begin working. Call your first tool now."""
+
+        # The conversation history — this is what makes it multi-turn
+        messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_message},
+        ]
+
+        # Get native tool schemas for the LLM
+        tool_schemas = self.tools.get_tool_schemas_native()
+
+        max_steps = 25
         max_consecutive_errors = getattr(self.config, "max_consecutive_errors", 2)
 
         no_tool_count = 0
         error_count = 0
-        write_count = 0
+        write_count = 0          # Successful (non-reverted) writes
+        write_attempts = 0       # Total write attempts (including reverted)
+        build_verify_enabled = self.config.verify_after_write and bool(self.config.build_command)
         files_already_read: set[str] = set()
-
-        # Each entry: {"tool_call": str, "result_full": str, "result_summary": str}
-        step_records: list[dict] = []
-        MAX_HISTORY_WINDOW = 10
+        # Cache grep results: key = (pattern, path, include), value = result text
+        grep_cache: dict[tuple, str] = {}
+        # Track web_search queries to prevent search spirals
+        web_search_queries: list[str] = []
+        MAX_WEB_SEARCHES = 3
 
         # Step budget thresholds for escalating write nudges
-        NUDGE_SOFT = int(max_steps * 0.5)    # 50% — gentle reminder
-        NUDGE_HARD = int(max_steps * 0.75)   # 75% — strong warning
-        NUDGE_FINAL = int(max_steps * 0.9)   # 90% — last chance
+        NUDGE_SOFT = int(max_steps * 0.5)
+        NUDGE_HARD = int(max_steps * 0.75)
+        NUDGE_FINAL = int(max_steps * 0.9)
 
         for step in range(max_steps):
-            # --- Build prompt: base + summarised older steps + full recent step ---
-            window = step_records[-MAX_HISTORY_WINDOW:]
-            history_parts = []
-
-            if len(step_records) > MAX_HISTORY_WINDOW:
-                history_parts.append(
-                    f"({len(step_records) - MAX_HISTORY_WINDOW} earlier steps omitted)\n"
-                )
-
-            for idx, rec in enumerate(window):
-                is_latest = (idx == len(window) - 1)
-                result_text = rec["result_full"] if is_latest else rec["result_summary"]
-                history_parts.append(
-                    f"\nExecuted: {rec['tool_call']}\nResult:\n{result_text}\n"
-                )
-
-            if history_parts:
-                history_parts.append("Call the next tool (or call done() if finished):")
-
-            # Escalating nudges when the agent is only reading
-            if write_count == 0 and step >= NUDGE_SOFT:
+            # --- Inject nudge if the agent hasn't written anything ---
+            # But DON'T nag if the model HAS been trying (write_attempts > 0)
+            # — that means build failures are reverting its work, not laziness.
+            if write_count == 0 and write_attempts == 0 and step >= NUDGE_SOFT:
                 remaining = max_steps - step
                 if step >= NUDGE_FINAL:
-                    history_parts.append(
-                        f"\n** FINAL WARNING: You have {remaining} steps left and have "
-                        f"NOT written any code yet. Call file_write NOW with the changes "
-                        f"or the task will fail. Do NOT read any more files. **"
+                    nudge = (
+                        f"FINAL WARNING: You have {remaining} steps left and have "
+                        f"NOT written any code yet. Call file_edit or file_write NOW "
+                        f"or the task will fail."
                     )
                 elif step >= NUDGE_HARD:
-                    history_parts.append(
-                        f"\n** WARNING: You have used {step}/{max_steps} steps reading "
-                        f"files but have NOT called file_write yet. You MUST start "
-                        f"writing code NOW. You have enough information. **"
+                    nudge = (
+                        f"WARNING: You have used {step}/{max_steps} steps reading "
+                        f"files but have NOT called file_edit yet. You MUST start "
+                        f"making changes NOW."
                     )
                 else:
-                    history_parts.append(
-                        f"\nNote: You have used {step} of {max_steps} steps. "
-                        f"Start making changes with file_write soon."
+                    nudge = (
+                        f"Note: You have used {step} of {max_steps} steps. "
+                        f"Start making changes with file_edit soon."
                     )
+                messages.append({"role": "user", "content": nudge})
 
-            prompt = base_prompt + "\n" + "\n".join(history_parts)
+            # --- Manage context window: summarize old tool results ---
+            self._trim_messages(messages)
 
-            response = self.llm.generate(prompt, skill.system_prompt)
+            # --- Call the LLM ---
+            response = self.llm.chat_with_tools(messages, tool_schemas)
 
-            # Handle LLM failure (empty response = timeout or error)
-            if not response or not response.strip():
+            # Handle empty response (timeout / error)
+            if response.is_empty:
                 error_count += 1
                 self.logger.warning(
                     "LLM returned empty response (%d/%d consecutive errors)",
@@ -442,95 +641,382 @@ Action: list_files(path=".")
                 )
                 if error_count >= max_consecutive_errors:
                     self.logger.error(
-                        "Aborting execution: %d consecutive LLM failures (likely timeout). "
-                        "Try reducing task complexity or increasing the LLM timeout.",
-                        error_count,
+                        "Aborting: %d consecutive LLM failures.", error_count
                     )
                     return False
-                # Trim history aggressively on error to shrink context for retry
-                step_records = step_records[-3:]
+                # Add a retry nudge
+                messages.append({
+                    "role": "user",
+                    "content": "Your last response was empty. Call a tool now.",
+                })
                 continue
 
             error_count = 0
 
-            if self.config.verbose:
-                context.execution_log.append(f"Step {step + 1}:\n{response}")
-            else:
-                context.execution_log.append(f"Step {step + 1}: {response[:200]}...")
+            # --- Handle text-only response (no tool call) ---
+            if not response.is_tool_call:
+                if self.config.verbose:
+                    context.execution_log.append(f"Step {step + 1}:\n{response.text}")
+                else:
+                    context.execution_log.append(f"Step {step + 1}: {response.text[:200]}...")
 
-            tool_calls = self.llm.extract_tool_calls(response)
-
-            if not tool_calls:
-                if any(word in response.lower() for word in ["done", "complete", "finished", "all changes"]):
-                    return True
+                # Append the assistant's text reply to history
+                messages.append({"role": "assistant", "content": response.text})
 
                 no_tool_count += 1
                 if no_tool_count >= 3:
-                    self.logger.warning("Model not producing tool calls after %d attempts", no_tool_count)
+                    self.logger.warning(
+                        "Model not producing tool calls after %d attempts", no_tool_count
+                    )
                     return True
 
-                step_records.append({
-                    "tool_call": "(no tool called)",
-                    "result_full": "You MUST call a tool now. Do not explain. Output ONLY the tool call.\nExample: list_files(path=\".\")",
-                    "result_summary": "You MUST call a tool now.",
+                messages.append({
+                    "role": "user",
+                    "content": "You MUST call a tool now. Do not explain — just call the tool.",
                 })
-            else:
-                no_tool_count = 0
-                tool_call = tool_calls[0]
-                self.logger.info(f"Executing: {tool_call}")
+                continue
 
-                if tool_call.startswith('done('):
-                    self.logger.info("Task completed - done tool called")
-                    return True
+            # --- Handle tool call ---
+            no_tool_count = 0
+            tc = response.tool_call
+            call_display = tc.to_call_string()
+            self.logger.info(f"Step {step + 1}: {call_display}")
+            context.execution_log.append(f"Step {step + 1}: {call_display}")
 
-                # Deduplicate full-file reads (line-range re-reads are allowed)
-                if tool_call.startswith('file_read('):
-                    path_match = re.search(r'path\s*=\s*["\']([^"\']+)["\']', tool_call)
-                    has_range = re.search(r'(start_line|end_line)\s*=', tool_call)
-                    if path_match and not has_range:
-                        read_path = path_match.group(1)
-                        if read_path in files_already_read:
-                            msg = (
-                                f"You already read {read_path}. The content is in your earlier context. "
-                                f"Use start_line/end_line to revisit specific sections."
-                            )
-                            step_records.append({
-                                "tool_call": tool_call,
-                                "result_full": msg,
-                                "result_summary": msg,
-                            })
-                            self.logger.info(f"Skipped duplicate read of {read_path}")
-                            continue
-                        files_already_read.add(read_path)
+            # Done tool
+            if tc.name == "done":
+                self.logger.info("Task completed - done tool called")
+                # Append assistant message for clean history
+                self._append_tool_call_messages(messages, response, "DONE")
+                return True
 
-                if tool_call.startswith('file_write('):
-                    write_count += 1
+            # Deduplicate full-file reads
+            if tc.name == "file_read":
+                read_path = tc.arguments.get("path", "")
+                has_range = "start_line" in tc.arguments or "end_line" in tc.arguments
+                if read_path and not has_range and read_path in files_already_read:
+                    msg = (
+                        f"You already read {read_path}. The content is in the conversation. "
+                        f"Use start_line/end_line to revisit specific sections."
+                    )
+                    self._append_tool_call_messages(messages, response, msg)
+                    self.logger.info(f"Skipped duplicate read of {read_path}")
+                    continue
+                if read_path and not has_range:
+                    files_already_read.add(read_path)
 
-                result = self.tools.execute(tool_call)
-
-                if self.config.verbose:
-                    self.logger.info(f"Result:\n{result}")
+            # Deduplicate grep calls with similar patterns
+            if tc.name == "grep":
+                grep_key = (
+                    tc.arguments.get("pattern", ""),
+                    tc.arguments.get("path", "."),
+                    tc.arguments.get("include", ""),
+                )
+                skip_grep = False
+                # Check for exact duplicate
+                if grep_key in grep_cache:
+                    msg = (
+                        f"You already searched for this pattern. Previous results:\n"
+                        f"{grep_cache[grep_key]}"
+                    )
+                    self._append_tool_call_messages(messages, response, msg)
+                    self.logger.info(f"Skipped duplicate grep: {grep_key[0]}")
+                    skip_grep = True
                 else:
-                    self.logger.info(f"Result: {result[:200]}...")
+                    # Check for similar pattern (substring of a previous search)
+                    current_pattern = grep_key[0]
+                    for cached_key, cached_result in grep_cache.items():
+                        cached_pattern = cached_key[0]
+                        same_scope = grep_key[1] == cached_key[1]
+                        if same_scope and current_pattern and cached_pattern:
+                            if current_pattern in cached_pattern or cached_pattern in current_pattern:
+                                msg = (
+                                    f"Similar search already done (pattern: '{cached_pattern}'). "
+                                    f"Previous results:\n{cached_result}\n\n"
+                                    f"Use file_read with start_line/end_line to examine specific matches."
+                                )
+                                self._append_tool_call_messages(messages, response, msg)
+                                self.logger.info(
+                                    f"Skipped similar grep: '{current_pattern}' ~= '{cached_pattern}'"
+                                )
+                                skip_grep = True
+                                break
+                if skip_grep:
+                    continue
 
-                if "not found" in result.lower():
-                    result += "\n\nIMPORTANT: Use list_files to find the correct path before trying file_read again."
+            # Limit and deduplicate web_search calls
+            if tc.name == "web_search":
+                query = tc.arguments.get("query", "")
+                query_lower = query.lower().strip()
 
-                step_records.append({
-                    "tool_call": tool_call,
-                    "result_full": result,
-                    "result_summary": self._summarize_result(tool_call, result, summary_chars),
-                })
+                # Check if we've already searched for something very similar
+                skip_search = False
+                for prev_query in web_search_queries:
+                    prev_lower = prev_query.lower().strip()
+                    # Exact or near-duplicate
+                    if query_lower == prev_lower:
+                        skip_search = True
+                        break
+                    # Significant overlap (>60% of words in common)
+                    q_words = set(query_lower.split())
+                    p_words = set(prev_lower.split())
+                    if q_words and p_words:
+                        overlap = len(q_words & p_words) / max(len(q_words), len(p_words))
+                        if overlap > 0.6:
+                            skip_search = True
+                            break
+
+                if skip_search:
+                    msg = (
+                        f"You already searched for something very similar. "
+                        f"Previous searches: {web_search_queries}\n"
+                        f"Use the information you already have from the code. "
+                        f"Follow existing patterns in the codebase instead of searching."
+                    )
+                    self._append_tool_call_messages(messages, response, msg)
+                    self.logger.info(f"Skipped duplicate web_search: {query}")
+                    continue
+
+                if len(web_search_queries) >= MAX_WEB_SEARCHES:
+                    msg = (
+                        f"Web search limit reached ({MAX_WEB_SEARCHES} searches). "
+                        f"You have enough information. Follow existing code patterns "
+                        f"and start making changes with file_edit."
+                    )
+                    self._append_tool_call_messages(messages, response, msg)
+                    self.logger.info(f"Web search limit reached, blocked: {query}")
+                    continue
+
+                web_search_queries.append(query)
+
+            # Track mutations
+            is_mutation = tc.name in ("file_write", "file_edit")
+            if is_mutation:
+                write_count += 1
+                write_attempts += 1
+
+            # --- Execute the tool ---
+            result = self.tools.execute_by_name(tc.name, tc.arguments)
+
+            # Cache grep results for deduplication
+            if tc.name == "grep" and "Error" not in result:
+                grep_key = (
+                    tc.arguments.get("pattern", ""),
+                    tc.arguments.get("path", "."),
+                    tc.arguments.get("include", ""),
+                )
+                grep_cache[grep_key] = result
+
+            # --- Auto-verify after mutations ---
+            if is_mutation and "Error" not in result and build_verify_enabled:
+                verify_output, is_tool_broken = self._run_build_check()
+                if is_tool_broken:
+                    # The build tool itself can't run (PATH issue, missing binary, etc.)
+                    # Keep the edit — the code is probably fine, the environment is broken.
+                    build_verify_enabled = False
+                    self.logger.warning(
+                        "Build tool is not available (%s). "
+                        "Disabling auto-verify for the rest of this task. "
+                        "The edit has been KEPT.",
+                        verify_output[:100],
+                    )
+                    result += (
+                        f"\n\n⚠ Build tool not available ({self.config.build_command}). "
+                        f"Auto-verify disabled. Your edit has been kept."
+                    )
+                elif verify_output:
+                    # Real build error — the code change broke something. Revert.
+                    written_path = tc.arguments.get("path", "")
+                    if written_path:
+                        revert_result = self.tools.execute_by_name("revert_file", {"path": written_path})
+                        result += (
+                            f"\n\n⚠ BUILD FAILED after this change — file has been auto-reverted.\n"
+                            f"Build output:\n{verify_output}\n"
+                            f"Revert: {revert_result}\n"
+                            f"Fix the issue and try again."
+                        )
+                        write_count -= 1
+                        self.logger.warning("Auto-reverted %s after build failure", written_path)
+
+            if self.config.verbose:
+                self.logger.info(f"Result:\n{result}")
+            else:
+                self.logger.info(f"Result: {result[:200]}...")
+
+            if "not found" in result.lower():
+                result += "\n\nIMPORTANT: Use file_tree or list_files to find the correct path."
+
+            # --- Append tool call + result to conversation history ---
+            self._append_tool_call_messages(messages, response, result)
 
         if write_count == 0:
             self.logger.warning(
-                "Execution used all %d steps without calling file_write "
-                "(read-loop detected: %d files read). The model investigated "
-                "but never wrote code.",
+                "Execution used all %d steps without calling file_write/file_edit "
+                "(read-loop detected: %d files read).",
                 max_steps, len(files_already_read),
             )
 
         return True
+
+    def _append_tool_call_messages(
+        self,
+        messages: list,
+        response: ChatResponse,
+        result: str,
+    ) -> None:
+        """Append the assistant's tool call + tool result to the conversation.
+
+        For native tool calling, uses the proper message format.
+        For text fallback, simulates it with assistant + user messages.
+        """
+        tc = response.tool_call
+        if not tc:
+            return
+
+        if self.llm.supports_tools and tc.raw_id:
+            # Native format: assistant message with tool_calls + tool result message
+            import json
+            messages.append({
+                "role": "assistant",
+                "content": response.text or None,
+                "tool_calls": [{
+                    "id": tc.raw_id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": json.dumps(tc.arguments),
+                    },
+                }],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.raw_id,
+                "content": result,
+            })
+        elif self.llm.supports_tools and self.llm.server_type == "ollama":
+            # Ollama native: uses a slightly different format
+            import json
+            messages.append({
+                "role": "assistant",
+                "content": response.text or "",
+                "tool_calls": [{
+                    "function": {
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                    },
+                }],
+            })
+            messages.append({
+                "role": "tool",
+                "content": result,
+            })
+        else:
+            # Text fallback: simulate with assistant text + user providing result
+            call_str = tc.to_call_string()
+            messages.append({
+                "role": "assistant",
+                "content": response.text or call_str,
+            })
+            messages.append({
+                "role": "user",
+                "content": f"Tool result for {tc.name}:\n{result}\n\nCall the next tool (or done() if finished):",
+            })
+
+    def _trim_messages(self, messages: list, max_chars: int = 0) -> None:
+        """Trim older tool results in the conversation to manage context size.
+
+        Keeps the system message and last few exchanges intact but summarizes
+        older tool results to prevent context window overflow.
+        """
+        max_chars = max_chars or getattr(self.config, "max_prompt_chars", 80000)
+
+        # Estimate total size
+        total = sum(len(str(m.get("content", ""))) for m in messages)
+        if total <= max_chars:
+            return
+
+        # Summarize tool results from oldest to newest (skip system + first user)
+        # Never touch the last 6 messages (current exchange)
+        for i in range(2, max(2, len(messages) - 6)):
+            msg = messages[i]
+            content = msg.get("content") or ""
+            if msg.get("role") in ("tool", "user") and len(content) > 500:
+                # Summarize long tool results
+                if content.startswith("[") and "lines]" in content[:80]:
+                    # File read result — keep header + first/last lines
+                    lines = content.splitlines()
+                    if len(lines) > 20:
+                        header = lines[0]
+                        top = "\n".join(lines[1:8])
+                        bottom = "\n".join(lines[-3:])
+                        msg["content"] = (
+                            f"{header}\n{top}\n"
+                            f"  ... ({len(lines) - 11} lines summarized) ...\n"
+                            f"{bottom}"
+                        )
+                else:
+                    msg["content"] = content[:400] + "\n...(trimmed)"
+
+            total = sum(len(str(m.get("content", ""))) for m in messages)
+            if total <= max_chars:
+                return
+
+        # If still too big, drop oldest messages (except system + first user)
+        while total > max_chars and len(messages) > 8:
+            removed = messages.pop(2)
+            total -= len(str(removed.get("content", "")))
+
+    # Patterns that indicate the build TOOL is broken, not the code
+    _BUILD_TOOL_BROKEN_PATTERNS = [
+        "is not recognized as an internal or external command",  # Windows cmd
+        "not recognized as a cmdlet",  # PowerShell
+        "command not found",  # Unix
+        "No such file or directory",  # Unix missing binary
+        "Cannot find module",  # Node missing module
+        "MODULE_NOT_FOUND",  # Node
+        "ENOENT",  # Node file not found
+    ]
+
+    def _run_build_check(self) -> tuple[str, bool]:
+        """Run the configured build command.
+
+        Returns (error_output, is_tool_broken):
+          - ("", False) on success
+          - (output, False) on real build/type error (code is wrong)
+          - (output, True) if the build tool itself can't run (PATH, missing binary, etc.)
+        """
+        if not self.config.build_command:
+            return "", False
+        try:
+            import subprocess
+            result = subprocess.run(
+                self.config.build_command,
+                shell=True,
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode == 0:
+                return "", False
+
+            output = (result.stdout + "\n" + result.stderr).strip()
+            if len(output) > 2000:
+                output = output[:2000] + "\n...(build output truncated)"
+
+            # Check if the failure is the tool itself, not the code
+            is_tool_broken = any(
+                pattern in output for pattern in self._BUILD_TOOL_BROKEN_PATTERNS
+            )
+            return output, is_tool_broken
+
+        except subprocess.TimeoutExpired:
+            return "Build command timed out after 120 seconds", False
+        except FileNotFoundError:
+            return f"Build command not found: {self.config.build_command}", True
+        except Exception as e:
+            self.logger.warning(f"Build check failed to run: {e}")
+            return "", False  # Don't block on unknown failures
     
     def _review_changes(self, context: TaskContext, skill: Skill) -> str:
         """Review the changes made."""

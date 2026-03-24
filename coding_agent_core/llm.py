@@ -1,19 +1,52 @@
 from __future__ import annotations
 
+import json
 import logging
-import os
-from typing import Optional
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 from .config import AgentConfig
+
+
+@dataclass
+class ToolCall:
+    """A structured tool call from the LLM."""
+    name: str
+    arguments: Dict[str, Any]
+    raw_id: str = ""  # OpenAI tool_call id for multi-turn
+
+    def to_call_string(self) -> str:
+        """Convert back to the text format for logging/display."""
+        args = ", ".join(f'{k}="{v}"' for k, v in self.arguments.items())
+        return f"{self.name}({args})"
+
+
+@dataclass
+class ChatResponse:
+    """Response from a chat() call — either text, a tool call, or both."""
+    text: str = ""
+    tool_call: Optional[ToolCall] = None
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_tool_call(self) -> bool:
+        return self.tool_call is not None
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.text.strip() and self.tool_call is None
 
 
 class LLMManager:
     """Manages LLM interactions.
 
+    Supports two modes:
+      1. generate() — single-shot text generation (planning, review).
+      2. chat_with_tools() — multi-turn conversation with native tool calling.
+
     Auto-detects whether the server is OpenAI-compatible (LM Studio, vLLM, etc.)
     or Ollama and uses the correct API format.
-
-    Source IP binding is handled globally via apply_source_ip_binding() in main().
     """
 
     def __init__(self, config: AgentConfig):
@@ -26,12 +59,14 @@ class LLMManager:
         # Setup dedicated LLM logger
         self.llm_logger = logging.getLogger("coding-agent.llm")
         self.llm_logger.setLevel(logging.DEBUG if config.verbose else logging.INFO)
-        
+
         # Add file handler for LLM logs
         llm_log_path = config.workspace_dir / "llm.log"
         try:
             llm_handler = logging.FileHandler(llm_log_path, mode="w", encoding="utf-8")
-            llm_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S"))
+            llm_handler.setFormatter(logging.Formatter(
+                "%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S"
+            ))
             self.llm_logger.addHandler(llm_handler)
             self.llm_logger.info(f"LLM log file: {llm_log_path}")
         except Exception as e:
@@ -39,9 +74,14 @@ class LLMManager:
 
         # Detect server type
         self.server_type = self._detect_server_type()
+        self._tools_supported: Optional[bool] = None  # Lazy probe
         logging.getLogger("coding-agent").info(
             "LLM server detected as: %s at %s", self.server_type, self.base_url
         )
+
+    # ------------------------------------------------------------------
+    # Server detection
+    # ------------------------------------------------------------------
 
     def _detect_server_type(self) -> str:
         """Detect whether the LLM server is OpenAI-compatible or Ollama."""
@@ -67,24 +107,90 @@ class LLMManager:
         except Exception:
             pass
 
-        # Default to openai-compat (most common for LM Studio)
         logging.getLogger("coding-agent").warning(
             "Could not detect server type, defaulting to openai-compat"
         )
         return "openai"
 
-    def generate(self, prompt: str, system_prompt: str = "", force_tool: str = None) -> str:
-        """Generate text using the LLM, with automatic prompt truncation.
-        
-        Args:
-            prompt: The user prompt
-            system_prompt: The system prompt
-            force_tool: If set, force the model to call this specific tool
-        """
+    @property
+    def supports_tools(self) -> bool:
+        """Probe once whether the model supports native tool calling."""
+        if self._tools_supported is not None:
+            return self._tools_supported
+
+        self._tools_supported = self._probe_tool_support()
+        logging.getLogger("coding-agent").info(
+            "Native tool calling: %s",
+            "supported" if self._tools_supported else "NOT supported (using text fallback)",
+        )
+        return self._tools_supported
+
+    def _probe_tool_support(self) -> bool:
+        """Send a tiny request with a dummy tool to see if the server handles it."""
         import requests as _req
 
-        max_chars = getattr(self.config, "max_prompt_chars", 40000)
+        dummy_tool = {
+            "type": "function",
+            "function": {
+                "name": "test_probe",
+                "description": "A test probe",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"x": {"type": "string"}},
+                },
+            },
+        }
+        messages = [{"role": "user", "content": "Call test_probe with x=\"hello\"."}]
 
+        try:
+            if self.server_type == "openai":
+                resp = _req.post(
+                    f"{self.base_url}/v1/chat/completions",
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "tools": [dummy_tool],
+                        "max_tokens": 128,
+                        "temperature": 0,
+                        "stream": False,
+                    },
+                    timeout=60,
+                )
+                if resp.status_code != 200:
+                    return False
+                data = resp.json()
+                msg = data.get("choices", [{}])[0].get("message", {})
+                return "tool_calls" in msg and msg["tool_calls"] is not None
+            else:
+                # Ollama /api/chat with tools
+                resp = _req.post(
+                    f"{self.base_url}/api/chat",
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "tools": [dummy_tool],
+                        "stream": False,
+                        "options": {"num_predict": 128},
+                    },
+                    timeout=60,
+                )
+                if resp.status_code != 200:
+                    return False
+                data = resp.json()
+                msg = data.get("message", {})
+                return bool(msg.get("tool_calls"))
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # Single-shot generate (for planning, review, etc.)
+    # ------------------------------------------------------------------
+
+    def generate(self, prompt: str, system_prompt: str = "") -> str:
+        """Single-shot text generation. Used for planning + review phases."""
+        import requests as _req
+
+        max_chars = getattr(self.config, "max_prompt_chars", 80000)
         total = len(system_prompt) + len(prompt)
         if total > max_chars:
             logger = logging.getLogger("coding-agent")
@@ -98,172 +204,362 @@ class LLMManager:
                 total, len(system_prompt) + len(prompt), max_chars,
             )
 
-        # Log the prompt being sent
         self.llm_logger.info("=" * 60)
+        self.llm_logger.info("GENERATE (single-shot)")
         self.llm_logger.info(f"MODEL: {self.model}")
-        self.llm_logger.info(f"TEMP: {self.temperature}")
-        if force_tool:
-            self.llm_logger.info(f"FORCED TOOL: {force_tool}")
         if system_prompt:
-            self.llm_logger.info(f"SYSTEM PROMPT:\n{system_prompt}")
-        self.llm_logger.info(f"USER PROMPT:\n{prompt}")
+            self.llm_logger.info(f"SYSTEM PROMPT:\n{system_prompt[:500]}...")
+        self.llm_logger.info(f"USER PROMPT:\n{prompt[:1000]}...")
         self.llm_logger.info("-" * 60)
 
-        if self.server_type == "openai":
-            response = self._generate_openai(prompt, system_prompt, _req, force_tool)
-        else:
-            response = self._generate_ollama(prompt, system_prompt, _req, force_tool)
-
-        self.llm_logger.info(f"RESPONSE:\n{response}")
-        self.llm_logger.info("=" * 60)
-        
-        return response
-
-    def _generate_openai(self, prompt: str, system_prompt: str, _req, force_tool: str = None) -> str:
-        """Generate via OpenAI-compatible /v1/chat/completions (LM Studio, vLLM)."""
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": self.num_predict,
-            "stream": False,
-        }
+        if self.server_type == "openai":
+            response = self._call_openai(messages, _req)
+        else:
+            response = self._call_ollama(messages, _req)
 
-        # Add tool_choice if forcing a specific tool
-        if force_tool:
-            payload["tool_choice"] = {
-                "type": "function",
-                "function": {"name": force_tool}
-            }
+        text = response.text
+        self.llm_logger.info(f"RESPONSE:\n{text[:2000]}...")
+        self.llm_logger.info("=" * 60)
+        return text
 
+    # ------------------------------------------------------------------
+    # Multi-turn chat with tools (the main execution loop)
+    # ------------------------------------------------------------------
+
+    def chat_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+    ) -> ChatResponse:
+        """Send a multi-turn conversation with tool definitions.
+
+        Returns a ChatResponse with either text or a structured ToolCall.
+        Falls back to text-based tool extraction if native tools aren't supported.
+        """
+        import requests as _req
+
+        self.llm_logger.info("=" * 60)
+        self.llm_logger.info(f"CHAT (multi-turn, {len(messages)} msgs, {len(tools)} tools)")
+        last_msg = messages[-1] if messages else {}
+        self.llm_logger.info(f"Last msg role={last_msg.get('role')}: {str(last_msg.get('content', ''))[:500]}...")
+        self.llm_logger.info("-" * 60)
+
+        if self.supports_tools:
+            response = self._chat_native(messages, tools, _req)
+        else:
+            response = self._chat_text_fallback(messages, tools, _req)
+
+        if response.tool_call:
+            self.llm_logger.info(f"TOOL CALL: {response.tool_call.to_call_string()}")
+        elif response.text:
+            self.llm_logger.info(f"TEXT RESPONSE: {response.text[:1000]}...")
+        else:
+            self.llm_logger.info("EMPTY RESPONSE")
+        self.llm_logger.info("=" * 60)
+
+        return response
+
+    def _chat_native(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        _req,
+    ) -> ChatResponse:
+        """Call the LLM with native tool definitions."""
         logger = logging.getLogger("coding-agent")
 
+        try:
+            if self.server_type == "openai":
+                resp = _req.post(
+                    f"{self.base_url}/v1/chat/completions",
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "tools": tools,
+                        "temperature": self.temperature,
+                        "max_tokens": self.num_predict,
+                        "stream": False,
+                    },
+                    timeout=300,
+                )
+            else:
+                # Ollama /api/chat
+                resp = _req.post(
+                    f"{self.base_url}/api/chat",
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "tools": tools,
+                        "stream": False,
+                        "options": {
+                            "temperature": self.temperature,
+                            "num_predict": self.num_predict,
+                        },
+                    },
+                    timeout=300,
+                )
+
+            if resp.status_code != 200:
+                body = resp.text[:500]
+                logger.error("LLM error %s: %s", resp.status_code, body)
+                return ChatResponse()
+
+            data = resp.json()
+            return self._parse_native_response(data)
+
+        except Exception as e:
+            logger.error("LLM chat call failed: %s", e)
+            return ChatResponse()
+
+    def _parse_native_response(self, data: Dict[str, Any]) -> ChatResponse:
+        """Parse a native tool-calling response from OpenAI or Ollama format."""
+        # OpenAI format
+        if "choices" in data:
+            msg = data["choices"][0].get("message", {})
+            text = msg.get("content") or ""
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                tc = tool_calls[0]  # Take only the first
+                func = tc.get("function", {})
+                try:
+                    args = json.loads(func.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                return ChatResponse(
+                    text=text,
+                    tool_call=ToolCall(
+                        name=func.get("name", ""),
+                        arguments=args,
+                        raw_id=tc.get("id", ""),
+                    ),
+                    raw=data,
+                )
+            return ChatResponse(text=text, raw=data)
+
+        # Ollama format
+        if "message" in data:
+            msg = data["message"]
+            text = msg.get("content") or ""
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                tc = tool_calls[0]
+                func = tc.get("function", {})
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                return ChatResponse(
+                    text=text,
+                    tool_call=ToolCall(
+                        name=func.get("name", ""),
+                        arguments=args,
+                    ),
+                    raw=data,
+                )
+            return ChatResponse(text=text, raw=data)
+
+        return ChatResponse()
+
+    # ------------------------------------------------------------------
+    # Text-based fallback (for models without native tool support)
+    # ------------------------------------------------------------------
+
+    def _chat_text_fallback(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        _req,
+    ) -> ChatResponse:
+        """Fall back to text-mode: send messages without tools param, parse text."""
+        if self.server_type == "openai":
+            response = self._call_openai(messages, _req)
+        else:
+            response = self._call_ollama(messages, _req)
+
+        if response.is_empty:
+            return response
+
+        # Try to parse a tool call from the text
+        tool_call = self._extract_tool_call_from_text(response.text)
+        if tool_call:
+            return ChatResponse(text=response.text, tool_call=tool_call)
+
+        return response
+
+    def _extract_tool_call_from_text(self, text: str) -> Optional[ToolCall]:
+        """Parse tool calls from freeform LLM text output (fallback mode)."""
+        tool_names = [
+            'file_tree', 'file_read', 'file_write', 'file_edit',
+            'bash', 'list_files', 'grep',
+            'git_status', 'git_diff', 'revert_file',
+            'web_search', 'done',
+        ]
+
+        earliest_pos = len(text)
+        earliest_name = None
+        earliest_raw = None
+
+        for tool_name in tool_names:
+            pos = text.find(tool_name + '(')
+            if pos != -1 and pos < earliest_pos:
+                start = pos + len(tool_name)
+                paren_str = self._parse_balanced_parens(text, start)
+                if paren_str is not None:
+                    earliest_pos = pos
+                    earliest_name = tool_name
+                    earliest_raw = tool_name + paren_str
+
+        if earliest_name and earliest_raw:
+            args = self._parse_text_args(earliest_raw)
+            return ToolCall(name=earliest_name, arguments=args)
+
+        # Check for explicit done phrases
+        text_lower = text.lower().strip()
+        done_phrases = [
+            'task complete', 'task completed', 'all done', 'all changes done',
+            'all tasks complete', 'work is done', 'work is complete',
+        ]
+        if any(phrase in text_lower for phrase in done_phrases):
+            return ToolCall(name="done", arguments={"message": "Task completed"})
+
+        return None
+
+    @staticmethod
+    def _parse_text_args(call_str: str) -> Dict[str, Any]:
+        """Parse key=value arguments from a text tool call string."""
+        match = re.match(r'\w+\((.*)\)$', call_str, re.DOTALL)
+        if not match:
+            return {}
+
+        args_str = match.group(1)
+        kwargs: Dict[str, Any] = {}
+        i = 0
+
+        while i < len(args_str):
+            while i < len(args_str) and args_str[i] in ' ,\t\n':
+                i += 1
+            if i >= len(args_str):
+                break
+
+            key_match = re.match(r'(\w+)\s*=\s*', args_str[i:])
+            if not key_match:
+                break
+            key = key_match.group(1)
+            i += key_match.end()
+
+            if i < len(args_str) and args_str[i] in ('"', "'"):
+                quote = args_str[i]
+                i += 1
+                value_chars = []
+                while i < len(args_str):
+                    if args_str[i] == '\\' and i + 1 < len(args_str):
+                        next_ch = args_str[i + 1]
+                        if next_ch == 'n':
+                            value_chars.append('\n')
+                        elif next_ch == 't':
+                            value_chars.append('\t')
+                        else:
+                            value_chars.append(next_ch)
+                        i += 2
+                    elif args_str[i] == quote:
+                        i += 1
+                        break
+                    else:
+                        value_chars.append(args_str[i])
+                        i += 1
+                kwargs[key] = ''.join(value_chars)
+            else:
+                val_match = re.match(r'([^,\s]*)', args_str[i:])
+                if val_match:
+                    kwargs[key] = val_match.group(1)
+                    i += val_match.end()
+
+        return kwargs
+
+    # ------------------------------------------------------------------
+    # Low-level API calls (shared by generate and chat fallback)
+    # ------------------------------------------------------------------
+
+    def _call_openai(self, messages: List[Dict[str, Any]], _req) -> ChatResponse:
+        """Call OpenAI-compatible /v1/chat/completions (no tools)."""
+        logger = logging.getLogger("coding-agent")
         try:
             resp = _req.post(
                 f"{self.base_url}/v1/chat/completions",
-                json=payload,
-                timeout=300,  # LLM generation can be slow
-            )
-            if resp.status_code != 200:
-                body = resp.text[:500]
-                logger.error(
-                    "OpenAI-compat error %s: %s (prompt ~%d chars)",
-                    resp.status_code, body, len(prompt) + len(system_prompt),
-                )
-                return ""
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
-        except Exception as e:
-            logger.error("OpenAI-compat LLM call failed: %s", e)
-            return ""
-
-    def _generate_ollama(self, prompt: str, system_prompt: str, _req, force_tool: str = None) -> str:
-        """Generate via Ollama /api/generate.
-        
-        Note: Ollama doesn't support tool_choice, so we add guidance in the prompt instead.
-        """
-        # For Ollama, we can't force tool_choice, but we can modify the prompt
-        # to strongly encourage the model to call the tool
-        if force_tool:
-            prompt = f"{prompt}\n\nIMPORTANT: You MUST call the {force_tool} tool now. Do not explain. Just call the tool."
-        
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "system": system_prompt,
-            "options": {
-                "temperature": self.temperature,
-                "num_predict": self.num_predict,
-            },
-            "stream": False,
-        }
-
-        logger = logging.getLogger("coding-agent")
-
-        try:
-            resp = _req.post(
-                f"{self.base_url}/api/generate",
-                json=payload,
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": self.temperature,
+                    "max_tokens": self.num_predict,
+                    "stream": False,
+                },
                 timeout=300,
             )
             if resp.status_code != 200:
                 body = resp.text[:500]
-                logger.error(
-                    "Ollama error %s: %s (prompt ~%d chars)",
-                    resp.status_code, body, len(prompt) + len(system_prompt),
-                )
-                return ""
+                logger.error("OpenAI-compat error %s: %s", resp.status_code, body)
+                return ChatResponse()
             data = resp.json()
-            return data.get("response", "")
+            text = data["choices"][0]["message"].get("content") or ""
+            return ChatResponse(text=text, raw=data)
+        except Exception as e:
+            logger.error("OpenAI-compat LLM call failed: %s", e)
+            return ChatResponse()
+
+    def _call_ollama(self, messages: List[Dict[str, Any]], _req) -> ChatResponse:
+        """Call Ollama /api/chat (NOT /api/generate — chat supports roles + tools)."""
+        logger = logging.getLogger("coding-agent")
+        try:
+            resp = _req.post(
+                f"{self.base_url}/api/chat",
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {
+                        "temperature": self.temperature,
+                        "num_predict": self.num_predict,
+                    },
+                },
+                timeout=300,
+            )
+            if resp.status_code != 200:
+                body = resp.text[:500]
+                logger.error("Ollama error %s: %s", resp.status_code, body)
+                return ChatResponse()
+            data = resp.json()
+            text = data.get("message", {}).get("content") or ""
+            return ChatResponse(text=text, raw=data)
         except Exception as e:
             logger.error("Ollama LLM call failed: %s", e)
-            return ""
+            return ChatResponse()
+
+    # ------------------------------------------------------------------
+    # Legacy helpers (kept for backward compatibility)
+    # ------------------------------------------------------------------
 
     def extract_tool_calls(self, text: str) -> list:
-        """Extract tool calls from LLM output.
-
-        Uses a simple state-machine parser to correctly handle parentheses
-        inside quoted string arguments (e.g. code content with function calls).
-        Only extracts the FIRST tool call found to prevent multiple executions.
-        """
-        tool_names = ['file_read', 'file_write', 'bash', 'list_files', 'grep', 'git_status', 'web_search', 'done']
-        
-        # First check for tool simulation (model describes tool use instead of calling it)
-        # Patterns like: "I will use web_search", "using file_read to..."
-        simulation_patterns = [
-            r'I will use (?:the )?(\w+)',
-            r'using (?:the )?(\w+) to',
-            r'call (?:the )?(\w+)',
-            r'execute (?:the )?(\w+)',
-        ]
-        
-        # Check for JSON-style tool calls in text
-        import re
-        json_patterns = [
-            r'\{["\']tool["\']:\s*["\'](\w+)["\']',
-            r'\{["\']name["\']:\s*["\'](\w+)["\']',
-        ]
-        
-        # Find FIRST occurrence of any tool call
-        earliest_pos = len(text)
-        earliest_call = None
-        
-        for tool_name in tool_names:
-            # Look for tool_name(
-            pos = text.find(tool_name + '(')
-            if pos != -1 and pos < earliest_pos:
-                start = pos + len(tool_name)
-                call_str = self._parse_balanced_parens(text, start)
-                if call_str is not None:
-                    earliest_call = tool_name + call_str
-                    earliest_pos = pos
-        
-        if earliest_call:
-            return [earliest_call]
-        
-        # Check for done signal in text
-        text_lower = text.lower()
-        if any(word in text_lower for word in ['done', 'complete', 'finished', 'all changes', 'task complete', 'all done']):
-            return ['done(message="Task completed")']
-        
+        """Legacy: extract tool call strings from text. Returns list of strings."""
+        tc = self._extract_tool_call_from_text(text)
+        if tc:
+            return [tc.to_call_string()]
         return []
 
     @staticmethod
     def _parse_balanced_parens(text: str, start: int) -> Optional[str]:
-        """Parse from an opening '(' to its matching ')', respecting quotes.
-
-        Returns the substring from '(' to ')' inclusive, or None if not found.
-        """
+        """Parse from an opening '(' to its matching ')', respecting quotes."""
         if start >= len(text) or text[start] != '(':
             return None
 
         depth = 0
-        in_quote = None  # None, '"', or "'"
+        in_quote = None
         escape = False
         i = start
 

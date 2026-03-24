@@ -254,29 +254,89 @@ class BashTool:
     def __init__(self, cwd: Path):
         self.cwd = cwd
     
+    # Regex to strip ANSI escape codes from output
+    _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+    def _strip_shell_pipes(self, command: str) -> str:
+        """Remove trailing shell pipe commands like | head -100, | tail -50, | cat.
+        
+        These are unreliable on Windows (cmd.exe + Git Bash mix) and cause
+        empty output. We handle truncation in Python instead.
+        """
+        # Strip trailing pipes to head/tail/cat/grep (common truncation patterns)
+        # Be careful not to strip meaningful pipes (e.g., command1 | command2)
+        cleaned = re.sub(
+            r'\s*\|\s*(head|tail|cat)(\s+-[0-9n]+)?\s*$',
+            '',
+            command,
+        )
+        # Also strip "2>&1" — we capture both streams in Python
+        cleaned = re.sub(r'\s*2>&1\s*', ' ', cleaned).strip()
+        return cleaned
+
     def execute(self, command: str) -> str:
         # Second layer of defense: check command for dangerous patterns
         is_safe, reason = self._check_dangerous_command(command)
         if not is_safe:
             return f"Error: Command blocked by safety guard - {reason}\n\nThis command attempts to modify system components. The agent is not allowed to:\n- Install or upgrade system packages\n- Modify system-wide Python/Java/Node\n- Execute potentially destructive commands\n\nIf you need to install project dependencies, use:\n- pip install -r requirements.txt\n- npm install\n- Just regular commands without sudo/brew upgrade"
         
+        # Use a longer timeout for test/build commands
+        timeout = 60
+        cmd_lower = command.lower()
+        if any(kw in cmd_lower for kw in ['test', 'jest', 'vitest', 'pytest', 'build', 'compile', 'tsc']):
+            timeout = 180  # 3 minutes for test/build commands
+
+        # Strip unreliable shell pipes — handle truncation in Python
+        clean_command = self._strip_shell_pipes(command)
+
+        # Run in CI-like mode:
+        # - CI=true: makes Jest, CRA, npm, etc. non-interactive
+        # - stdin=DEVNULL: closes stdin so interactive prompts get EOF
+        # - FORCE_COLOR=0 + NO_COLOR=1: prevents ANSI color codes in output
+        env = os.environ.copy()
+        env["CI"] = "true"
+        env["FORCE_COLOR"] = "0"
+        env["NO_COLOR"] = "1"
+
         try:
             result = subprocess.run(
-                command,
+                clean_command,
                 shell=True,
                 cwd=self.cwd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,   # Merge stderr into stdout
                 text=True,
-                timeout=60
+                timeout=timeout,
+                stdin=subprocess.DEVNULL,
+                env=env,
             )
-            output = result.stdout if result.stdout else "(no output)"
-            if result.stderr:
-                output += f"\nStderr: {result.stderr}"
+            output = result.stdout.strip() if result.stdout else ""
+            
+            # Strip ANSI color codes that slip through
+            output = self._ANSI_RE.sub('', output)
+            
+            if not output:
+                output = "(no output)"
+            
             if result.returncode != 0:
                 output += f"\nExit code: {result.returncode}"
+            
+            # Truncate very long test/build output — keep first and last parts
+            if len(output) > 8000:
+                output = (
+                    output[:4000]
+                    + f"\n\n... ({len(output) - 6000} chars omitted) ...\n\n"
+                    + output[-2000:]
+                )
+            
             return output
         except subprocess.TimeoutExpired:
-            return "Error: Command timed out after 60 seconds"
+            return (
+                f"Error: Command timed out after {timeout} seconds.\n"
+                f"This usually means the command is waiting for interactive input.\n"
+                f"For test commands, try: npm test -- --watchAll=false\n"
+                f"Or check that CI=true is set in the environment."
+            )
         except Exception as e:
             return f"Error executing command: {e}"
     
@@ -418,6 +478,337 @@ class GrepTool:
             return f"Error searching: {e}"
 
 
+class FileTreeTool:
+    """Return a recursive directory tree (like the `tree` command)."""
+    name = "file_tree"
+    description = "Show the full project directory tree (2-3 levels deep). Call once at the start to understand project structure."
+
+    schema = {
+        "name": "file_tree",
+        "description": "Return a recursive directory tree of the project. Use this ONCE at the start instead of repeated list_files calls.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Root path to tree (default: current directory)"
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Maximum depth to recurse (default: 3)"
+                }
+            }
+        }
+    }
+
+    # Directories to always skip
+    SKIP_DIRS = {
+        'node_modules', '.git', '__pycache__', '.tox', '.mypy_cache',
+        '.pytest_cache', 'dist', 'build', '.next', '.nuxt', 'venv',
+        '.venv', 'env', '.env', '.eggs', '*.egg-info', 'coverage',
+        '.coverage', 'htmlcov', '.idea', '.vscode', 'target',
+    }
+
+    def __init__(self, cwd: Path = None):
+        self.cwd = cwd or Path(".")
+
+    def execute(self, path: str = ".", max_depth: str = "3") -> str:
+        try:
+            root = Path(path)
+            if not root.is_absolute():
+                root = self.cwd / root
+            if not root.exists():
+                return f"Error: Directory '{path}' not found"
+
+            depth_limit = int(max_depth)
+            lines = [f"{root.name}/"]
+            self._walk(root, "", depth_limit, 0, lines)
+
+            if len(lines) > 300:
+                lines = lines[:300]
+                lines.append(f"... (tree truncated at 300 entries)")
+
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error generating file tree: {e}"
+
+    def _walk(self, directory: Path, prefix: str, max_depth: int, current_depth: int, lines: list):
+        if current_depth >= max_depth:
+            return
+
+        try:
+            entries = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except PermissionError:
+            return
+
+        # Filter out skipped directories and hidden files
+        entries = [
+            e for e in entries
+            if not e.name.startswith('.') or e.name in ('.env.example', '.gitignore')
+            if e.name not in self.SKIP_DIRS
+        ]
+
+        for i, entry in enumerate(entries):
+            is_last = (i == len(entries) - 1)
+            connector = "└── " if is_last else "├── "
+            child_prefix = prefix + ("    " if is_last else "│   ")
+
+            if entry.is_dir():
+                lines.append(f"{prefix}{connector}{entry.name}/")
+                self._walk(entry, child_prefix, max_depth, current_depth + 1, lines)
+            else:
+                lines.append(f"{prefix}{connector}{entry.name}")
+
+
+class FileEditTool:
+    """Edit a file by replacing a specific text block (str_replace style)."""
+    name = "file_edit"
+    description = "Edit a file by replacing an exact text block with new text. Safer than file_write for modifying existing files."
+
+    schema = {
+        "name": "file_edit",
+        "description": "Replace a specific block of text in a file. The old_content must match EXACTLY (including whitespace/indentation). Use this instead of file_write when modifying existing files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to edit"
+                },
+                "old_content": {
+                    "type": "string",
+                    "description": "The exact text to find and replace (must match exactly, including whitespace)"
+                },
+                "new_content": {
+                    "type": "string",
+                    "description": "The replacement text"
+                }
+            },
+            "required": ["path", "old_content", "new_content"]
+        }
+    }
+
+    def __init__(self, cwd: Path = None, checkpoint_manager: Optional[CheckpointManager] = None):
+        self.cwd = cwd or Path(".")
+        self.checkpoint_manager = checkpoint_manager
+
+    def execute(self, path: str, old_content: str, new_content: str) -> str:
+        try:
+            file_path = Path(path)
+            if not file_path.is_absolute():
+                file_path = self.cwd / file_path
+
+            if not file_path.exists():
+                return f"Error: File '{path}' not found. Use file_tree or list_files to find the correct path."
+
+            content = file_path.read_text(encoding="utf-8")
+
+            # Count exact occurrences
+            count = content.count(old_content)
+
+            if count == 0:
+                # --- Whitespace-tolerant retry ---
+                # Try matching with normalized leading whitespace
+                match_result = self._fuzzy_whitespace_match(content, old_content)
+                if match_result:
+                    actual_old, match_count = match_result
+                    if match_count == 1:
+                        # Found a unique match with different indentation
+                        # Apply the edit using the actual text found in the file
+                        new_adjusted = self._adjust_indentation(actual_old, old_content, new_content)
+
+                        if self.checkpoint_manager:
+                            self.checkpoint_manager.snapshot_file(file_path)
+
+                        new_file_content = content.replace(actual_old, new_adjusted, 1)
+                        file_path.write_text(new_file_content, encoding="utf-8")
+
+                        old_lines = len(old_content.strip().split('\n'))
+                        new_lines = len(new_content.strip().split('\n'))
+                        return (
+                            f"Successfully edited {path}: replaced {old_lines} lines with {new_lines} lines. "
+                            f"(Note: auto-corrected whitespace mismatch)"
+                        )
+                    elif match_count > 1:
+                        return (
+                            f"Error: old_content matches {match_count} locations in '{path}' after whitespace normalization. "
+                            f"Include more surrounding context to make the match unique."
+                        )
+
+                # No match even with fuzzy whitespace — give a hint
+                first_line = old_content.strip().split('\n')[0].strip()
+                hint = ""
+                if first_line:
+                    for i, line in enumerate(content.split('\n'), 1):
+                        if first_line in line:
+                            hint = f"\nHint: Line {i} contains '{first_line[:60]}' — re-read the file around that line to get the exact text."
+                            break
+                return (
+                    f"Error: old_content not found in '{path}'. "
+                    f"The text must match EXACTLY, including whitespace and indentation.{hint}"
+                )
+
+            if count > 1:
+                return (
+                    f"Error: old_content matches {count} locations in '{path}'. "
+                    f"Include more surrounding context to make the match unique."
+                )
+
+            # Exact match found — apply edit
+            if self.checkpoint_manager:
+                self.checkpoint_manager.snapshot_file(file_path)
+
+            new_file_content = content.replace(old_content, new_content, 1)
+            file_path.write_text(new_file_content, encoding="utf-8")
+
+            old_lines = len(old_content.strip().split('\n'))
+            new_lines = len(new_content.strip().split('\n'))
+            return (
+                f"Successfully edited {path}: replaced {old_lines} lines with {new_lines} lines."
+            )
+        except Exception as e:
+            return f"Error editing file: {e}"
+
+    @staticmethod
+    def _normalize_lines(text: str) -> str:
+        """Strip leading whitespace from each line for fuzzy comparison."""
+        return '\n'.join(line.lstrip() for line in text.split('\n'))
+
+    @classmethod
+    def _fuzzy_whitespace_match(cls, file_content: str, old_content: str):
+        """Try to find old_content in file_content ignoring leading whitespace.
+
+        Returns (actual_text_found, match_count) or None if no match.
+        """
+        old_normalized = cls._normalize_lines(old_content)
+        old_line_count = len(old_content.split('\n'))
+        file_lines = file_content.split('\n')
+
+        matches = []
+        for start_idx in range(len(file_lines) - old_line_count + 1):
+            window = file_lines[start_idx:start_idx + old_line_count]
+            window_normalized = '\n'.join(line.lstrip() for line in window)
+            if window_normalized == old_normalized:
+                actual_text = '\n'.join(window)
+                matches.append(actual_text)
+
+        if matches:
+            return matches[0], len(matches)
+        return None
+
+    @staticmethod
+    def _adjust_indentation(actual_old: str, requested_old: str, new_content: str) -> str:
+        """Adjust new_content indentation to match what's actually in the file.
+
+        If the model sent old_content with 2-space indent but the file uses 4-space,
+        shift new_content by the same delta.
+        """
+        actual_lines = actual_old.split('\n')
+        requested_lines = requested_old.split('\n')
+
+        # Find the indentation delta from the first non-empty line
+        delta = 0
+        for a_line, r_line in zip(actual_lines, requested_lines):
+            a_indent = len(a_line) - len(a_line.lstrip())
+            r_indent = len(r_line) - len(r_line.lstrip())
+            if a_line.strip() and r_line.strip():
+                delta = a_indent - r_indent
+                break
+
+        if delta == 0:
+            return new_content
+
+        # Apply the delta to every line of new_content
+        adjusted_lines = []
+        for line in new_content.split('\n'):
+            if not line.strip():
+                adjusted_lines.append(line)
+            elif delta > 0:
+                adjusted_lines.append(' ' * delta + line)
+            else:
+                # Remove leading spaces (but don't go negative)
+                strip_amount = min(abs(delta), len(line) - len(line.lstrip()))
+                adjusted_lines.append(line[strip_amount:])
+
+        return '\n'.join(adjusted_lines)
+
+
+class RevertFileTool:
+    """Revert a file to its state at the current branch's base commit."""
+    name = "revert_file"
+    description = "Revert a file to its original state (undo all changes made by the agent)"
+
+    schema = {
+        "name": "revert_file",
+        "description": "Revert a file to its original state from the base branch. Use this when a file_write or file_edit corrupted a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to revert"
+                }
+            },
+            "required": ["path"]
+        }
+    }
+
+    def __init__(self, repo, cwd: Path = None):
+        self.repo = repo
+        self.cwd = cwd or Path(".")
+
+    def execute(self, path: str) -> str:
+        try:
+            self.repo.git.checkout("--", path)
+            return f"Successfully reverted '{path}' to its original state."
+        except Exception as e:
+            return f"Error reverting file: {e}"
+
+
+class GitDiffTool:
+    """Show git diff for a specific file or the whole repo."""
+    name = "git_diff"
+    description = "Show the git diff of changes made so far (optionally for a specific file)"
+
+    schema = {
+        "name": "git_diff",
+        "description": "Show git diff of uncommitted changes. Use to review your work before calling done().",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Optional: specific file path to diff. Omit for all changes."
+                }
+            }
+        }
+    }
+
+    def __init__(self, repo):
+        self.repo = repo
+
+    def execute(self, path: str = "") -> str:
+        try:
+            if path:
+                diff = self.repo.git.diff("--", path)
+            else:
+                diff = self.repo.git.diff()
+
+            if not diff:
+                # Also check for new untracked files
+                untracked = self.repo.untracked_files
+                if untracked:
+                    return f"No diff for tracked files. New untracked files:\n" + "\n".join(f"  + {f}" for f in untracked)
+                return "No changes detected."
+
+            # Truncate very large diffs
+            if len(diff) > 8000:
+                diff = diff[:8000] + f"\n... (diff truncated, {len(diff) - 8000} chars omitted)"
+            return diff
+        except Exception as e:
+            return f"Error getting diff: {e}"
+
+
 class GitStatusTool:
     """Check git status."""
     name = "git_status"
@@ -468,79 +859,59 @@ class DoneTool:
 
 
 class SearchGuard:
-    """Validates web search queries to ensure they are general questions, not code."""
-    
+    """Validates web search queries to block raw code dumps while allowing developer questions.
+
+    The goal is to prevent the agent from pasting code into a search engine,
+    NOT to block natural-language questions that happen to mention code concepts
+    like package names, decorators, or HTML tags.
+    """
+
+    # Only block queries that look like actual code, not natural-language questions
     CODE_PATTERNS = [
-        r'def\s+\w+',           # function definitions
-        r'class\s+\w+',         # class definitions
-        r'import\s+\w+',       # imports
-        r'from\s+\w+\s+import', # from imports
-        r'function\s+\w+\s*\(', # JS functions
-        r'const\s+\w+\s*=',     # JS const
-        r'let\s+\w+\s*=',       # JS let
-        r'var\s+\w+\s*=',       # JS var
-        r'=\s*\{',              # object literals
-        r'\[.*\]\s*=',          # array assignments
-        r'<\w+>',               # HTML/JSX tags
-        r'#include',            # C/C++ includes
-        r'package\s+\w+',       # Go/Java packages
-        r'pub\s+fn',            # Rust functions
-        r'func\s+\w+',          # Go functions
-        r'@\w+',                # decorators
-        r'\$\w+',               # PHP/jQuery
-        r'select\s+.*from',    # SQL SELECT
-        r'insert\s+into',      # SQL INSERT
-        r'create\s+table',     # SQL CREATE
-        r'update\s+\w+\s+set', # SQL UPDATE
-        r'delete\s+from',      # SQL DELETE
-        r'where\s+\w+',         # SQL WHERE
+        r'def\s+\w+\s*\(',        # function definitions with parens
+        r'class\s+\w+\s*[:\(]',    # class definitions
+        r'from\s+\w+\s+import',    # from imports
+        r'const\s+\w+\s*=',       # JS const assignments
+        r'let\s+\w+\s*=',         # JS let assignments
+        r'var\s+\w+\s*=',         # JS var assignments
+        r'#include\s*[<"]',        # C/C++ includes
+        r'pub\s+fn\s+\w+',        # Rust functions
+        r'select\s+\*?\s+from',   # SQL SELECT
+        r'insert\s+into',         # SQL INSERT
+        r'create\s+table',        # SQL CREATE
     ]
-    
-    CODE_EXTENSIONS = [
-        r'\.py\b', r'\.js\b', r'\.ts\b', r'\.jsx\b', r'\.tsx\b',
-        r'\.java\b', r'\.go\b', r'\.rs\b', r'\.c\b', r'\.cpp\b',
-        r'\.h\b', r'\.cs\b', r'\.rb\b', r'\.php\b', r'\.sql\b',
+
+    # Only block if query is mostly code (has assignment + braces/parens)
+    CODE_SYNTAX_PATTERNS = [
+        r'\{[\s\S]{20,}\}',       # large object/block literals (20+ chars)
+        r'\[[\s\S]{20,}\]',       # large array literals
+        r';\s*\n',                 # semicolons with newlines (multi-line code)
     ]
-    
+
     @classmethod
     def is_safe_query(cls, query: str) -> tuple[bool, str]:
         """
-        Validate if a search query is safe (general question, not code).
+        Validate if a search query is safe (general question, not code dump).
         Returns (is_safe, reason_if_unsafe)
         """
         if not query or not query.strip():
             return False, "Query is empty"
-        
-        query_lower = query.lower().strip()
-        
-        # Check for code patterns
+
+        # Check for definite code patterns (not just mentions)
         for pattern in cls.CODE_PATTERNS:
             if re.search(pattern, query, re.IGNORECASE):
                 return False, f"Query contains code pattern: {pattern}"
-        
-        # Check for file extensions (likely trying to search for code)
-        for ext in cls.CODE_EXTENSIONS:
-            if re.search(ext, query, re.IGNORECASE):
-                return False, f"Query appears to reference a code file: {ext}"
-        
-        # Check for common code keywords that shouldn't be searched on the web
-        code_keywords = [
-            r'^\s*def\s', r'^\s*class\s', r'^\s*function\s',
-            r'\{[\s\S]*\}', r'\[[\s\S]*\]',  # braces/brackets
-            r'==\s*\w+', r'!=\s*\w+',  # comparisons
-            r'&&\s', r'\|\|\s',  # logical operators
-            r';\s*$',  # semicolons at end
-        ]
-        
-        for keyword in code_keywords:
-            if re.search(keyword, query):
-                return False, "Query appears to contain code syntax"
-        
-        # Query should be a natural language question (at least 3 words for context)
+
+        # Check for multi-line code syntax
+        for pattern in cls.CODE_SYNTAX_PATTERNS:
+            if re.search(pattern, query):
+                return False, "Query appears to contain code blocks"
+
+        # Query should be at least 2 words
         words = query.split()
         if len(words) < 2:
             return False, "Query too short - provide a general question"
-        
+
         return True, ""
 
 
@@ -756,8 +1127,10 @@ class ToolRegistry:
     def _register_default_tools(self, config: AgentConfig, repo):
         cwd = Path(repo.working_dir or ".") if repo else Path(".")
         checkpoint_manager = CheckpointManager(cwd, config.workspace_dir)
+        self.tools["file_tree"] = FileTreeTool(cwd)
         self.tools["file_read"] = FileReadTool(cwd)
         self.tools["file_write"] = FileWriteTool(cwd, checkpoint_manager=checkpoint_manager)
+        self.tools["file_edit"] = FileEditTool(cwd, checkpoint_manager=checkpoint_manager)
         self.tools["bash"] = BashTool(cwd)
         self.tools["list_files"] = ListFilesTool(cwd)
         self.tools["grep"] = GrepTool(cwd)
@@ -765,6 +1138,8 @@ class ToolRegistry:
         self.tools["done"] = DoneTool()
         if repo:
             self.tools["git_status"] = GitStatusTool(repo)
+            self.tools["git_diff"] = GitDiffTool(repo)
+            self.tools["revert_file"] = RevertFileTool(repo, cwd)
     
     def register(self, tool):
         self.tools[tool.name] = tool
@@ -794,6 +1169,54 @@ class ToolRegistry:
     def list_tools_simple(self) -> str:
         """Simple list of tools with descriptions (fallback)."""
         return "\n".join([f"- {name}: {tool.description}" for name, tool in self.tools.items()])
+
+    def get_tool_schemas_native(self) -> list:
+        """Return tool schemas in OpenAI/Ollama native function-calling format.
+
+        Format: [{"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}]
+        """
+        schemas = []
+        for name, tool in self.tools.items():
+            if hasattr(tool, 'schema'):
+                s = tool.schema
+                schemas.append({
+                    "type": "function",
+                    "function": {
+                        "name": s.get("name", name),
+                        "description": s.get("description", ""),
+                        "parameters": s.get("parameters", {"type": "object", "properties": {}}),
+                    },
+                })
+            else:
+                schemas.append({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": getattr(tool, 'description', ''),
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                })
+        return schemas
+
+    def execute_by_name(self, name: str, kwargs: dict) -> str:
+        """Execute a tool by name with a dict of arguments (for native tool calling)."""
+        tool = self.get(name)
+        if not tool:
+            return f"Error: Unknown tool '{name}'. Available: {list(self.tools.keys())}"
+        try:
+            # Convert all values to strings for tools that expect string args
+            # (e.g. start_line="50" vs start_line=50)
+            str_kwargs = {k: str(v) if not isinstance(v, str) else v for k, v in kwargs.items()}
+            return tool.execute(**str_kwargs)
+        except TypeError as e:
+            # If string conversion causes issues, try with original types
+            try:
+                return tool.execute(**kwargs)
+            except Exception:
+                return f"Error executing {name}: {e}"
+        except Exception as e:
+            return f"Error executing {name}: {e}"
+
     
     def execute(self, tool_call: str) -> str:
         """Execute a tool from a tool call string like 'file_read(path="foo.txt")'"""

@@ -36,6 +36,8 @@ class AgentConfig:
     max_consecutive_errors: int = 2  # Bail after N consecutive LLM failures
     auto_commit: bool = True
     verbose: bool = False
+    build_command: str = ""  # e.g. "npm run build", "tsc --noEmit", "python -m py_compile"
+    verify_after_write: bool = True  # Auto-run build_command after every file_write/file_edit
 
 
 @dataclass
