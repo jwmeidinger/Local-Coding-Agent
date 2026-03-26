@@ -65,6 +65,13 @@ Examples:
                         help="Bind to specific local IP (e.g., 10.152.50.103) to bypass VPNs")
     parser.add_argument("--temperature", type=float, default=0.2,
                         help="LLM temperature")
+    parser.add_argument("--embed-model", default="",
+                        help="Embedding model loaded in LM Studio for semantic search "
+                             "(e.g. nomic-embed-text-v1.5). Uses same LLM_URL server.")
+    parser.add_argument("--embed-dims", type=int, default=768,
+                        help="Output dimensions of the embedding model "
+                             "(nomic-embed-text-v1.5=768, mxbai-embed-large-v1=1024). "
+                             "Must match the model exactly. (default: 768)")
     
     parser.add_argument("--max-iterations", type=int, default=5,
                         help="Max execution iterations per task")
@@ -143,11 +150,19 @@ Examples:
         if not VECTOR_MEMORY_AVAILABLE:
             print("Error: Vector memory not available. Install psycopg2-binary", file=sys.stderr)
             sys.exit(1)
-        
+
+        embed_label = args.embed_model or "fallback (non-semantic)"
+        print(f"Embedding model: {embed_label}  dims: {args.embed_dims}")
+
         for repo_path in repo_paths:
             print(f"\nIndexing codebase: {repo_path}")
             try:
-                memory_manager = VectorMemoryManager(repo_path)
+                memory_manager = VectorMemoryManager(
+                    repo_path,
+                    embed_url=args.llm_url,
+                    embed_model=args.embed_model,
+                    embed_dims=args.embed_dims,
+                )
                 stats = memory_manager.index_codebase()
                 print(f"  Files indexed: {stats['indexed']}")
                 print(f"  Files updated: {stats['updated']}")
@@ -174,7 +189,12 @@ Examples:
         for repo_path in repo_paths:
             print(f"\n--- Results from {repo_path.name} ---")
             try:
-                memory_manager = VectorMemoryManager(repo_path)
+                memory_manager = VectorMemoryManager(
+                    repo_path,
+                    embed_url=args.llm_url,
+                    embed_model=args.embed_model,
+                    embed_dims=args.embed_dims,
+                )
                 results = memory_manager.search_codebase(args.search, limit=10)
                 if results:
                     for i, r in enumerate(results, 1):
@@ -210,4 +230,6 @@ Examples:
         verbose=args.verbose,
         build_command=args.build_command,
         verify_after_write=not args.no_verify,
+        embed_model=args.embed_model,
+        embed_dims=args.embed_dims,
     )

@@ -31,8 +31,16 @@ class ExecutionEngine:
         # Initialize vector memory system
         if VECTOR_MEMORY_AVAILABLE:
             try:
-                self.memory_manager = VectorMemoryManager(repo_path)
-                self.logger.info(f"Vector memory system initialized for {repo_path.name}")
+                self.memory_manager = VectorMemoryManager(
+                    repo_path,
+                    embed_url=config.llm_url,
+                    embed_model=config.embed_model,
+                    embed_dims=config.embed_dims,
+                )
+                self.logger.info(
+                    "Vector memory initialized for %s (embed_model=%r, dims=%d)",
+                    repo_path.name, config.embed_model or "none (fallback)", config.embed_dims,
+                )
             except Exception as e:
                 self.logger.warning(
                     "Vector memory unavailable (%r). Falling back to no memory. "
@@ -542,13 +550,27 @@ IMPORTANT RULES:
             plan_text = plan_text[:3000] + "\n...(plan truncated)"
 
         # --- Build initial messages ---
+        # --- Windows-specific instructions ---
+        windows_rules = ""
+        if self.system_context.os_name == "Windows":
+            windows_rules = """
+## Windows Environment Rules
+- You are running on Windows. Use Windows-compatible paths and commands.
+- Do NOT use Unix paths like ./node_modules/.bin/jest or /c/Users/...
+- Use backslash paths or forward-slash relative paths: node_modules\\.bin\\jest.cmd
+- For npm/npx scripts, prefer: npx jest, npm test, npm run <script>
+- Do NOT use shell pipes like | head, | tail, | grep — they are unreliable on Windows.
+- Do NOT use cd /c/... syntax — that is Git Bash Unix-style and won't work.
+- Do NOT install packages (npm install <pkg>, pip install <pkg>, etc.) — only use what's already available.
+"""
+
         system_message = skill.system_prompt + f"""
 
 {context.system_info}
 
 You are working in repository: {context.repo_path}
 All file paths are relative to this directory.
-
+{windows_rules}
 ## Rules
 1. Use file_tree output (provided below) instead of repeated list_files calls.
 2. Use file_edit to modify existing files (NOT file_write — file_write is for NEW files only).
@@ -557,14 +579,41 @@ All file paths are relative to this directory.
 5. When all work is done, call git_diff() to review, then done().
 6. FOLLOW EXISTING PATTERNS in the code. If the codebase already handles epic_title/epic_url, use the same pattern for milestone_title/milestone_url. Do NOT web_search for API docs when you can see the pattern in the code you already read.
 7. Limit web_search to 2 calls maximum. If you need API docs, read ONE page. Do not search repeatedly for the same topic.
+8. Do NOT install new packages or dependencies. Only use packages already in package.json / requirements.txt.
 """
 
         # --- Auto-detect project context from config files ---
         project_summary = self._get_project_summary()
 
+        # --- Previous iteration context ---
+        # If this is iteration 2+, tell the agent what it already discovered
+        prev_iteration_context = ""
+        if context.iteration > 1:
+            parts = []
+            if context.files_read:
+                parts.append(
+                    "Files you already read in previous iterations (DO NOT re-read these):\n"
+                    + "\n".join(f"  - {f}" for f in sorted(context.files_read))
+                )
+            if context.done_message:
+                parts.append(
+                    f"Your previous completion summary:\n{context.done_message}"
+                )
+            if context.review_feedback:
+                parts.append(
+                    f"Reviewer feedback to address:\n{context.review_feedback}"
+                )
+            if parts:
+                prev_iteration_context = (
+                    "\n## Previous Iteration Context\n"
+                    + "\n\n".join(parts)
+                    + "\n\nIMPORTANT: Use the context above. Do NOT re-read files you already read. "
+                    "Focus on addressing the reviewer's feedback.\n"
+                )
+
         user_message = f"""{memory_context}## Project File Tree
 {file_tree}
-{project_summary}
+{project_summary}{prev_iteration_context}
 Task: {context.task_description}
 
 Plan:
@@ -589,7 +638,8 @@ Begin working. Call your first tool now."""
         write_count = 0          # Successful (non-reverted) writes
         write_attempts = 0       # Total write attempts (including reverted)
         build_verify_enabled = self.config.verify_after_write and bool(self.config.build_command)
-        files_already_read: set[str] = set()
+        # Use persistent set from context — survives across iterations
+        files_already_read = context.files_read
         # Cache grep results: key = (pattern, path, include), value = result text
         grep_cache: dict[tuple, str] = {}
         # Track web_search queries to prevent search spirals
@@ -686,6 +736,8 @@ Begin working. Call your first tool now."""
             # Done tool
             if tc.name == "done":
                 self.logger.info("Task completed - done tool called")
+                # Store the agent's completion summary for the reviewer
+                context.done_message = tc.arguments.get("message", "")
                 # Append assistant message for clean history
                 self._append_tool_call_messages(messages, response, "DONE")
                 return True
@@ -1027,14 +1079,61 @@ Begin working. Call your first tool now."""
             diff = "Could not get diff"
             status = "Could not get status"
         
+        # Also include content of new (untracked) files — git diff misses these
+        untracked_section = ""
+        try:
+            untracked = self.repo.untracked_files
+            # Filter out workspace/checkpoint files
+            source_untracked = [
+                f for f in untracked
+                if not f.startswith(".coding-agent")
+                and not f.startswith("cat")
+                and not f.endswith(".txt;")
+            ]
+            if source_untracked:
+                parts = []
+                for fpath in source_untracked[:5]:  # Limit to 5 files
+                    try:
+                        full = self.repo_path / fpath
+                        content = full.read_text(encoding="utf-8", errors="replace")
+                        if len(content) > 2000:
+                            content = content[:2000] + "\n...(file truncated)"
+                        parts.append(f"--- NEW FILE: {fpath} ---\n{content}")
+                    except Exception:
+                        parts.append(f"--- NEW FILE: {fpath} (could not read) ---")
+                untracked_section = "\n\nNew (untracked) files:\n" + "\n\n".join(parts)
+        except Exception:
+            pass
+
         max_diff = 4000 if not self.config.verbose else 12000
-        diff_to_send = diff if len(diff) <= max_diff else (
-            diff[:max_diff] + f"\n...(diff truncated, {len(diff) - max_diff} chars omitted)"
+        combined_diff = diff + untracked_section
+        diff_to_send = combined_diff if len(combined_diff) <= max_diff else (
+            combined_diff[:max_diff] + f"\n...(diff truncated, {len(combined_diff) - max_diff} chars omitted)"
         )
         
         recent_log = context.execution_log[-3:]
         log_text = "\n".join(entry[:300] for entry in recent_log)
-        
+
+        # Include the agent's completion rationale so the reviewer
+        # understands WHY certain changes were (or weren't) made.
+        agent_summary = ""
+        if context.done_message:
+            agent_summary = f"""
+Agent's completion summary:
+{context.done_message}
+"""
+
+        # Include files the agent read — the reviewer should consider
+        # information from these files even if they weren't modified.
+        files_read_section = ""
+        if context.files_read:
+            files_read_section = (
+                "\nFiles the agent read during execution (may contain relevant context "
+                "even if not modified):\n"
+                + "\n".join(f"  - {f}" for f in sorted(context.files_read))
+                + "\n"
+            )
+
         prompt = f"""Review the changes made for this task:
 
 Task: {context.task_description}
@@ -1044,9 +1143,15 @@ Git Status:
 
 Changes (diff):
 {diff_to_send}
-
+{agent_summary}{files_read_section}
 Recent steps:
 {log_text}
+
+IMPORTANT: When evaluating whether a requirement is satisfied, consider ALL
+information available — not just the diff. If the agent read a file and found
+that a requirement is already implemented there (e.g., caching already exists
+in a helper module), that counts as satisfied even if the diff doesn't show
+changes to that file. The agent's completion summary above explains its reasoning.
 
 {skill.review_prompt}
 """

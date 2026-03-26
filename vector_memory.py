@@ -45,7 +45,14 @@ class CodeFile:
 class VectorMemoryManager:
     """Manages vector-based memory of the codebase using Postgres + pgvector."""
     
-    def __init__(self, repo_path: Path, db_config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        repo_path: Path,
+        db_config: Optional[Dict[str, Any]] = None,
+        embed_url: str = "",
+        embed_model: str = "",
+        embed_dims: int = 768,
+    ):
         if not PSYCOPG2_AVAILABLE:
             raise RuntimeError(
                 "psycopg2 is required for vector memory. "
@@ -54,6 +61,11 @@ class VectorMemoryManager:
         
         self.repo_path = repo_path
         self.logger = logging.getLogger("coding-agent.memory")
+
+        # Embedding configuration — points at LM Studio's /v1/embeddings endpoint
+        self.embed_url = embed_url.rstrip("/") if embed_url else ""
+        self.embed_model = embed_model
+        self.embed_dims = embed_dims
         
         # Database configuration
         self.db_config = db_config or {
@@ -79,13 +91,29 @@ class VectorMemoryManager:
             raise
     
     def _ensure_schema(self):
-        """Ensure database schema exists."""
+        """Ensure database schema exists, recreating tables if embedding dims changed."""
         with self.conn.cursor() as cur:
-            # Enable pgvector extension
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-            
-            # Create code_embeddings table
+
+            # Check whether code_embeddings already exists with a different dimension.
+            # pgvector stores the vector dimension in atttypmod for the column.
             cur.execute("""
+                SELECT a.atttypmod
+                FROM pg_attribute a
+                JOIN pg_class c ON a.attrelid = c.oid
+                WHERE c.relname = 'code_embeddings' AND a.attname = 'embedding'
+            """)
+            row = cur.fetchone()
+            if row is not None and row[0] != self.embed_dims:
+                self.logger.warning(
+                    "Embedding dimension mismatch: existing table has %d dims, "
+                    "configured embed_dims=%d. Dropping and recreating tables.",
+                    row[0], self.embed_dims,
+                )
+                cur.execute("DROP TABLE IF EXISTS task_memory CASCADE")
+                cur.execute("DROP TABLE IF EXISTS code_embeddings CASCADE")
+
+            cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS code_embeddings (
                     id SERIAL PRIMARY KEY,
                     repo_path TEXT NOT NULL,
@@ -96,32 +124,27 @@ class VectorMemoryManager:
                     summary TEXT,
                     key_functions TEXT[],
                     dependencies TEXT[],
-                    embedding VECTOR(1536),
+                    embedding VECTOR({self.embed_dims}),
                     last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(repo_path, file_path)
                 );
             """)
-            
-            # Create HNSW index for vector similarity search
+
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS code_embeddings_hnsw_idx 
+                CREATE INDEX IF NOT EXISTS code_embeddings_hnsw_idx
                 ON code_embeddings USING hnsw (embedding vector_cosine_ops);
             """)
-            
-            # Create indexes for filtering
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS code_embeddings_type_idx 
+                CREATE INDEX IF NOT EXISTS code_embeddings_type_idx
                 ON code_embeddings(file_type);
             """)
-            
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS code_embeddings_repo_idx 
+                CREATE INDEX IF NOT EXISTS code_embeddings_repo_idx
                 ON code_embeddings(repo_path);
             """)
-            
-            # Create task_memory table
-            cur.execute("""
+
+            cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS task_memory (
                     id SERIAL PRIMARY KEY,
                     task_id TEXT NOT NULL,
@@ -132,55 +155,67 @@ class VectorMemoryManager:
                     files_modified TEXT[],
                     execution_log TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    embedding VECTOR(1536),
+                    embedding VECTOR({self.embed_dims}),
                     UNIQUE(task_id)
                 );
             """)
-            
-            # Create index for task similarity
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS task_memory_hnsw_idx 
+                CREATE INDEX IF NOT EXISTS task_memory_hnsw_idx
                 ON task_memory USING hnsw (embedding vector_cosine_ops);
             """)
-            
+
             self.conn.commit()
-            self.logger.info("Database schema initialized")
+            self.logger.info(
+                "Database schema initialized (embed_dims=%d)", self.embed_dims
+            )
     
     def _compute_hash(self, content: str) -> str:
         """Compute MD5 hash of content."""
         return hashlib.md5(content.encode('utf-8')).hexdigest()
     
     def _generate_embedding(self, text: str, embedding_model: Any = None) -> List[float]:
-        """Generate embedding vector for text.
-        
-        If embedding_model is provided (e.g., OpenAI client), use it.
-        Otherwise, use a simple fallback (not for production).
+        """Generate an embedding vector via LM Studio's /v1/embeddings endpoint.
+
+        ``embedding_model`` is accepted for backward-compatibility but ignored;
+        the embed_url / embed_model set at construction time are used instead.
+        Falls back to a hash-based (non-semantic) vector when not configured.
         """
-        if embedding_model:
+        if self.embed_url and self.embed_model:
             try:
-                # Try to use provided embedding model
-                response = embedding_model.embeddings.create(
-                    model="text-embedding-3-small",
-                    input=text[:8000]  # Limit text length
+                import requests as _req
+                resp = _req.post(
+                    f"{self.embed_url}/v1/embeddings",
+                    json={"model": self.embed_model, "input": text[:8000]},
+                    timeout=60,
                 )
-                return response.data[0].embedding
+                resp.raise_for_status()
+                embedding = resp.json()["data"][0]["embedding"]
+                if len(embedding) != self.embed_dims:
+                    self.logger.warning(
+                        "Embedding model returned %d dims but embed_dims=%d. "
+                        "Update EMBED_DIMS in your .env to match the model.",
+                        len(embedding), self.embed_dims,
+                    )
+                return embedding
             except Exception as e:
-                self.logger.warning(f"Failed to generate embedding with model: {e}")
-        
-        # Fallback: Create a simple hash-based embedding (not semantic!)
-        # This is just for testing when no embedding service is available
-        self.logger.warning("Using fallback embedding (not semantic)")
-        
-        # Simple bag-of-words style embedding
+                self.logger.warning(
+                    "Embedding request to %s failed (%s). Using fallback.",
+                    self.embed_url, e,
+                )
+
+        return self._fallback_embedding(text)
+
+    def _fallback_embedding(self, text: str) -> List[float]:
+        """Hash-based pseudo-embedding — NOT semantic, only for testing/dev."""
+        self.logger.warning(
+            "Using non-semantic fallback embedding. "
+            "Set EMBED_MODEL in .env and load it in LM Studio for real semantic search."
+        )
         words = re.findall(r'\w+', text.lower())
-        embedding = [0.0] * 1536
-        
-        for word in words[:100]:  # Limit to first 100 words
-            # Hash word to position in embedding
-            hash_val = int(hashlib.md5(word.encode()).hexdigest(), 16)
-            pos = hash_val % 1536
+        embedding = [0.0] * self.embed_dims
+        for word in words[:100]:
+            pos = int(hashlib.md5(word.encode()).hexdigest(), 16) % self.embed_dims
             embedding[pos] = min(1.0, embedding[pos] + 0.1)
-        
         return embedding
     
     def index_codebase(self, embedding_model: Any = None, ignore_patterns: List[str] = None) -> Dict[str, Any]:

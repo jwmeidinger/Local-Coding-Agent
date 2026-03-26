@@ -267,28 +267,72 @@ Respond with:
     def get(self, name: str) -> Optional[Skill]:
         return self.skills.get(name)
     
+    # Skill keywords with their scores.
+    # Title matches (first line / filename) get a 3x multiplier so that
+    # incidental mentions of "test" deep in a spec body don't override
+    # the real intent.
+    _SKILL_KEYWORDS: dict[str, list[str]] = {
+        "test": [
+            "write test", "write tests", "write unit test", "write unit tests",
+            "add test", "add tests", "add unit test", "add unit tests",
+            "unit test", "unit tests", "unittest", "pytest", "jest test",
+            "spec test", "create test", "create tests", "test coverage",
+        ],
+        "bugfix": [
+            "bug", "fix", "error", "crash", "broken", "regression",
+            "not working", "fails", "failure", "defect",
+        ],
+        "refactor": [
+            "refactor", "restructure", "simplify", "clean up", "cleanup",
+            "decompose", "extract", "consolidate", "reorganize",
+        ],
+        "docs": [
+            "document", "documentation", "docstring", "readme",
+            "guide", "explain", "jsdoc", "comment",
+        ],
+    }
+
+    # Minimum score required to override the default "feature" skill.
+    # A single body-only mention (score=1) is not enough — it needs
+    # at least a title match (3) or multiple body matches (2+).
+    _MIN_SKILL_SCORE = 2
+
     def detect_skill(self, task_description: str) -> Skill:
-        """Auto-detect the best skill for a task."""
-        task_lower = task_description.lower()
-        
-        # Simple keyword matching - order matters (more specific first)
-        if any(word in task_lower for word in ["test", "tests", "testing", "unittest", "pytest", "spec"]):
-            skill = self.skills.get("test")
+        """Auto-detect the best skill for a task using weighted keyword scoring.
+
+        The first line of the task (or filename-derived title) is treated as
+        the "title" and gets a 3× weight multiplier.  This prevents a task
+        like "Optimize loading — add tests if needed" from being classified
+        as a test task just because "tests" appears in the description body.
+        """
+        import re as _re
+
+        lines = task_description.strip().splitlines()
+        title = lines[0].lower() if lines else ""
+        body = "\n".join(lines[1:]).lower() if len(lines) > 1 else ""
+
+        TITLE_WEIGHT = 3
+        BODY_WEIGHT = 1
+
+        scores: dict[str, int] = {}
+        for skill_name, keywords in self._SKILL_KEYWORDS.items():
+            score = 0
+            for kw in keywords:
+                # Use word-boundary matching so "test" doesn't match "latest"
+                pattern = r'(?:^|[\s\-_/,;:.(])' + _re.escape(kw) + r'(?:[\s\-_/,;:.)]|$)'
+                if _re.search(pattern, title):
+                    score += TITLE_WEIGHT
+                if _re.search(pattern, body):
+                    score += BODY_WEIGHT
+            if score >= self._MIN_SKILL_SCORE:
+                scores[skill_name] = score
+
+        if scores:
+            best = max(scores, key=scores.get)  # type: ignore[arg-type]
+            skill = self.skills.get(best)
             if skill:
                 return skill
-        elif any(word in task_lower for word in ["bug", "fix", "error", "crash", "broken"]):
-            skill = self.skills.get("bugfix")
-            if skill:
-                return skill
-        elif any(word in task_lower for word in ["refactor", "clean", "restructure", "improve", "simplify"]):
-            skill = self.skills.get("refactor")
-            if skill:
-                return skill
-        elif any(word in task_lower for word in ["doc", "comment", "readme", "guide", "explain"]):
-            skill = self.skills.get("docs")
-            if skill:
-                return skill
-        
+
         # Default to feature skill (always registered by _register_default_skills)
         skill = self.skills.get("feature")
         if skill:

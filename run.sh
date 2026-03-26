@@ -23,6 +23,12 @@ LLM_URL="${LLM_URL:-http://localhost:11434}"
 MODEL="${MODEL:-codellama}"
 SOURCE_IP="${SOURCE_IP:-}"  # Optional: bind to local IP to bypass VPN (e.g. SOURCE_IP=10.152.50.103)
 
+# Embedding model for semantic search (vector memory).
+# Load this model separately in LM Studio alongside your chat model.
+# Leave EMBED_MODEL empty to fall back to non-semantic hash embeddings.
+EMBED_MODEL="${EMBED_MODEL:-}"
+EMBED_DIMS="${EMBED_DIMS:-768}"  # Must match model output dims (nomic=768, mxbai-large=1024)
+
 # Git settings
 BASE_BRANCH="${BASE_BRANCH:-main}"
 BRANCH_PREFIX="${BRANCH_PREFIX:-agent/}"
@@ -149,6 +155,10 @@ if [ -n "${SOURCE_IP:-}" ]; then
   CMD+=(--source-ip "$SOURCE_IP")
 fi
 
+if [ -n "${EMBED_MODEL:-}" ]; then
+  CMD+=(--embed-model "$EMBED_MODEL" --embed-dims "$EMBED_DIMS")
+fi
+
 if [ -n "${BUILD_COMMAND:-}" ]; then
   CMD+=(--build-command "$BUILD_COMMAND")
 fi
@@ -170,6 +180,8 @@ CMD+=("$@")
 echo "Starting Coding Agent..."
 echo "Repository: $REPO_PATH"
 echo "Model: $MODEL"
+[ -n "${EMBED_MODEL:-}" ] && echo "Embed model: $EMBED_MODEL (dims: $EMBED_DIMS)"
+[ -z "${EMBED_MODEL:-}" ] && echo "Embed model: (none — set EMBED_MODEL for semantic search)"
 [ -n "${SOURCE_IP:-}" ] && echo "Source IP: $SOURCE_IP"
 [ -n "${BUILD_COMMAND:-}" ] && echo "Build command: $BUILD_COMMAND"
 [ "$NO_VERIFY" = "true" ] && echo "Auto-verify: DISABLED"

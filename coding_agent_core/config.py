@@ -29,6 +29,12 @@ class AgentConfig:
     source_ip: str = ""  # Bind to specific local IP to bypass VPNs
     max_prompt_chars: int = 80000  # ~20k tokens — fits 100k context with room for response
     max_tool_result_chars: int = 3000  # Summary size for older history entries
+
+    # Embedding settings (for vector memory / semantic search)
+    # embed_model: name of the embedding model loaded in LM Studio (e.g. nomic-embed-text-v1.5)
+    # embed_dims: output dimensions of that model — must match exactly (nomic=768, mxbai-large=1024)
+    embed_model: str = ""
+    embed_dims: int = 768
     
     # Execution settings
     max_iterations: int = 5
@@ -153,3 +159,7 @@ class TaskContext:
     execution_log: list = field(default_factory=list)
     files_modified: list = field(default_factory=list)
     review_feedback: Optional[str] = None
+    # Persistent across iterations — avoids re-reading the same files
+    files_read: set = field(default_factory=set)
+    # The agent's completion summary from done() — passed to reviewer
+    done_message: str = ""

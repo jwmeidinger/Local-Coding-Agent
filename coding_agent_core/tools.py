@@ -237,6 +237,21 @@ class BashTool:
         r'^\s*>\s*/dev/',
     ]
     
+    # Package install commands — the agent should NEVER install new packages.
+    # Project deps (npm install with no args, pip install -r) are allowed.
+    _PACKAGE_INSTALL_PATTERNS = [
+        r'npm\s+install\s+(?!--)(?!\.)(?!\s*$)',         # "npm install <pkg>" but NOT "npm install" (bare) or "npm install --save-dev"
+        r'npm\s+install\s+--save[\w-]*\s+',              # "npm install --save-dev <pkg>"
+        r'npm\s+i\s+(?!--)(?!\.)(?!\s*$)',                # "npm i <pkg>"
+        r'yarn\s+add\s+',                                 # "yarn add <pkg>"
+        r'pnpm\s+add\s+',                                 # "pnpm add <pkg>"
+        r'pip\s+install\s+(?!-r\s)(?!-e\s)(?!\.\s*$)',    # "pip install <pkg>" but NOT "pip install -r" or "pip install -e ." or "pip install ."
+        r'pip3\s+install\s+(?!-r\s)(?!-e\s)(?!\.\s*$)',
+        r'gem\s+install\s+',
+        r'cargo\s+install\s+',
+        r'go\s+install\s+',
+    ]
+    
     DANGEROUS_KEYWORDS = [
         'chmod 777',
         'chown',
@@ -278,7 +293,7 @@ class BashTool:
         # Second layer of defense: check command for dangerous patterns
         is_safe, reason = self._check_dangerous_command(command)
         if not is_safe:
-            return f"Error: Command blocked by safety guard - {reason}\n\nThis command attempts to modify system components. The agent is not allowed to:\n- Install or upgrade system packages\n- Modify system-wide Python/Java/Node\n- Execute potentially destructive commands\n\nIf you need to install project dependencies, use:\n- pip install -r requirements.txt\n- npm install\n- Just regular commands without sudo/brew upgrade"
+            return f"Error: Command blocked by safety guard - {reason}\n\nThis command attempts to modify system components. The agent is not allowed to:\n- Install or upgrade system packages\n- Install new project dependencies\n- Modify system-wide Python/Java/Node\n- Execute potentially destructive commands\n\nIf you need to install project dependencies, use:\n- pip install -r requirements.txt\n- npm install (bare, no package names)\n- Just regular commands without sudo/brew upgrade"
         
         # Use a longer timeout for test/build commands
         timeout = 60
@@ -298,24 +313,37 @@ class BashTool:
         env["FORCE_COLOR"] = "0"
         env["NO_COLOR"] = "1"
 
+        # Windows-specific: use cmd.exe explicitly and capture stderr separately
+        import sys
+        is_windows = sys.platform == "win32"
+
         try:
             result = subprocess.run(
                 clean_command,
                 shell=True,
                 cwd=self.cwd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,   # Merge stderr into stdout
+                stderr=subprocess.PIPE,    # Capture stderr separately
                 text=True,
                 timeout=timeout,
                 stdin=subprocess.DEVNULL,
                 env=env,
             )
-            output = result.stdout.strip() if result.stdout else ""
+            stdout = result.stdout.strip() if result.stdout else ""
+            stderr = result.stderr.strip() if result.stderr else ""
             
             # Strip ANSI color codes that slip through
-            output = self._ANSI_RE.sub('', output)
-            
-            if not output:
+            stdout = self._ANSI_RE.sub('', stdout)
+            stderr = self._ANSI_RE.sub('', stderr)
+
+            # Combine: prefer stdout, append stderr if stdout is empty or on error
+            if stdout and stderr and result.returncode != 0:
+                output = stdout + "\n\nSTDERR:\n" + stderr
+            elif not stdout and stderr:
+                output = stderr
+            elif stdout:
+                output = stdout
+            else:
                 output = "(no output)"
             
             if result.returncode != 0:
@@ -348,6 +376,15 @@ class BashTool:
         for pattern in self.DANGEROUS_PATTERNS:
             if re.search(pattern, command, re.IGNORECASE | re.MULTILINE):
                 return False, f"matches dangerous pattern: {pattern}"
+        
+        # Check package install patterns
+        for pattern in self._PACKAGE_INSTALL_PATTERNS:
+            if re.search(pattern, command, re.IGNORECASE):
+                return False, (
+                    f"attempts to install packages (matches: {pattern}). "
+                    f"The agent is not allowed to install new packages. "
+                    f"Only existing project dependencies may be used."
+                )
         
         # Check keywords
         for keyword in self.DANGEROUS_KEYWORDS:
@@ -762,6 +799,17 @@ class RevertFileTool:
             self.repo.git.checkout("--", path)
             return f"Successfully reverted '{path}' to its original state."
         except Exception as e:
+            # If git checkout fails, the file might be untracked (new file).
+            # In that case, delete it to "revert" to the state where it didn't exist.
+            try:
+                file_path = Path(path)
+                if not file_path.is_absolute():
+                    file_path = self.cwd / file_path
+                if file_path.exists():
+                    file_path.unlink()
+                    return f"Deleted untracked file '{path}' (was not in git)."
+            except Exception as del_err:
+                return f"Error reverting file: {e} (also failed to delete: {del_err})"
             return f"Error reverting file: {e}"
 
 
@@ -1204,14 +1252,29 @@ class ToolRegistry:
         if not tool:
             return f"Error: Unknown tool '{name}'. Available: {list(self.tools.keys())}"
         try:
+            # Determine which kwargs the tool's execute() actually accepts
+            import inspect
+            sig = inspect.signature(tool.execute)
+            valid_params = set(sig.parameters.keys())
+            has_var_keyword = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+
+            # Strip unexpected kwargs unless the method accepts **kwargs
+            if not has_var_keyword:
+                filtered = {k: v for k, v in kwargs.items() if k in valid_params}
+            else:
+                filtered = kwargs
+
             # Convert all values to strings for tools that expect string args
             # (e.g. start_line="50" vs start_line=50)
-            str_kwargs = {k: str(v) if not isinstance(v, str) else v for k, v in kwargs.items()}
+            str_kwargs = {k: str(v) if not isinstance(v, str) else v for k, v in filtered.items()}
             return tool.execute(**str_kwargs)
         except TypeError as e:
             # If string conversion causes issues, try with original types
             try:
-                return tool.execute(**kwargs)
+                return tool.execute(**filtered)
             except Exception:
                 return f"Error executing {name}: {e}"
         except Exception as e:
