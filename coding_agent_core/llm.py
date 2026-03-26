@@ -56,6 +56,10 @@ class LLMManager:
         self.temperature = config.temperature
         self.num_predict = config.num_predict
 
+        # Retry settings for transient failures
+        self.max_retries = getattr(config, "max_retries", 3)
+        self.retry_base_delay = 2  # seconds — doubles each retry (2, 4, 8)
+
         # Setup dedicated LLM logger
         self.llm_logger = logging.getLogger("coding-agent.llm")
         self.llm_logger.setLevel(logging.DEBUG if config.verbose else logging.INFO)
@@ -78,6 +82,65 @@ class LLMManager:
         logging.getLogger("coding-agent").info(
             "LLM server detected as: %s at %s", self.server_type, self.base_url
         )
+
+    # ------------------------------------------------------------------
+    # Retry wrapper for transient HTTP failures
+    # ------------------------------------------------------------------
+
+    # Exceptions that are worth retrying (server hiccup, not a logic error)
+    _TRANSIENT_ERRORS = (
+        "ConnectionError", "ConnectionRefusedError", "ConnectionResetError",
+        "Timeout", "ReadTimeout", "ConnectTimeout",
+    )
+
+    def _request_with_retry(self, method: str, url: str, **kwargs):
+        """HTTP request with exponential backoff for transient failures.
+
+        Retries on connection errors and timeouts but NOT on 4xx responses
+        (those indicate a real problem with the request).
+        """
+        import requests as _req
+        import time
+
+        logger = logging.getLogger("coding-agent")
+        last_err = None
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                resp = _req.request(method, url, **kwargs)
+
+                # Retry on 5xx server errors (LM Studio/Ollama overloaded)
+                if resp.status_code >= 500 and attempt < self.max_retries:
+                    delay = self.retry_base_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        "LLM server returned %d (attempt %d/%d). "
+                        "Retrying in %ds...",
+                        resp.status_code, attempt, self.max_retries, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+
+                return resp
+
+            except Exception as e:
+                last_err = e
+                err_type = type(e).__name__
+
+                if attempt < self.max_retries:
+                    delay = self.retry_base_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        "LLM request failed: %s (%s) — attempt %d/%d. "
+                        "Retrying in %ds...",
+                        err_type, str(e)[:100], attempt, self.max_retries, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        "LLM request failed after %d attempts: %s (%s)",
+                        self.max_retries, err_type, str(e)[:200],
+                    )
+
+        raise last_err  # type: ignore[misc]
 
     # ------------------------------------------------------------------
     # Server detection
@@ -275,7 +338,8 @@ class LLMManager:
 
         try:
             if self.server_type == "openai":
-                resp = _req.post(
+                resp = self._request_with_retry(
+                    "POST",
                     f"{self.base_url}/v1/chat/completions",
                     json={
                         "model": self.model,
@@ -289,7 +353,8 @@ class LLMManager:
                 )
             else:
                 # Ollama /api/chat
-                resp = _req.post(
+                resp = self._request_with_retry(
+                    "POST",
                     f"{self.base_url}/api/chat",
                     json={
                         "model": self.model,
@@ -491,7 +556,8 @@ class LLMManager:
         """Call OpenAI-compatible /v1/chat/completions (no tools)."""
         logger = logging.getLogger("coding-agent")
         try:
-            resp = _req.post(
+            resp = self._request_with_retry(
+                "POST",
                 f"{self.base_url}/v1/chat/completions",
                 json={
                     "model": self.model,
@@ -517,7 +583,8 @@ class LLMManager:
         """Call Ollama /api/chat (NOT /api/generate — chat supports roles + tools)."""
         logger = logging.getLogger("coding-agent")
         try:
-            resp = _req.post(
+            resp = self._request_with_retry(
+                "POST",
                 f"{self.base_url}/api/chat",
                 json={
                     "model": self.model,

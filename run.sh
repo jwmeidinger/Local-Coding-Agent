@@ -56,8 +56,7 @@ AGENT_SCRIPT="${AGENT_SCRIPT:-$(dirname "$0")/coding_agent.py}"
 # Python interpreter selection:
 # 1) PYTHON_BIN override
 # 2) project-local virtualenv
-# 3) python3 from PATH
-# 4) python from PATH
+# 3) python from PATH
 if [ -n "${PYTHON_BIN:-}" ]; then
   PYTHON="$PYTHON_BIN"
 elif [ -x "$(dirname "$0")/.venv/bin/python" ]; then

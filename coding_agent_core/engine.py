@@ -259,6 +259,9 @@ class ExecutionEngine:
     def execute_task(self, task_description: str, task_id: str, repo_path: Path = None) -> bool:
         """Execute a single task from start to finish."""
         self.logger.info(f"Starting execution of task: {task_id}")
+
+        # Ensure workspace directory exists (may have been cleaned up after previous task)
+        self.config.workspace_dir.mkdir(parents=True, exist_ok=True)
         
         # Check for system upgrade attempts
         is_safe, reason, report = SystemUpgradeGuard.is_safe_task(task_description)
@@ -580,6 +583,8 @@ All file paths are relative to this directory.
 6. FOLLOW EXISTING PATTERNS in the code. If the codebase already handles epic_title/epic_url, use the same pattern for milestone_title/milestone_url. Do NOT web_search for API docs when you can see the pattern in the code you already read.
 7. Limit web_search to 2 calls maximum. If you need API docs, read ONE page. Do not search repeatedly for the same topic.
 8. Do NOT install new packages or dependencies. Only use packages already in package.json / requirements.txt.
+9. NEVER use `as any` to call methods that don't exist in the codebase or type definitions. If TypeScript says a method doesn't exist, it doesn't exist at runtime either. Casting to `any` just hides the error — it will crash when the code actually runs. Instead, look for the correct method name in the existing code or type definitions.
+10. Do NOT include proprietary code, internal URLs, file contents, API keys, or project-specific identifiers in web_search queries. Keep searches to general technical questions only (e.g. "gitbeaker pagination API" not "how to paginate api.GroupLabels.all in our gitlab-reports app").
 """
 
         # --- Auto-detect project context from config files ---
@@ -1181,10 +1186,34 @@ changes to that file. The agent's completion summary above explains its reasonin
         return self.repo.is_dirty(untracked_files=True)
     
     def _commit_changes(self, task_id: str) -> None:
-        """Commit the changes."""
+        """Commit the changes, excluding agent workspace files."""
         try:
+            # Remove .coding-agent from the working tree before staging.
+            # This directory contains checkpoints, logs, and reports that
+            # should not be committed to the project's git history.
+            workspace_dir = self.repo_path / ".coding-agent"
+            if workspace_dir.exists():
+                import shutil
+                try:
+                    shutil.rmtree(workspace_dir)
+                    self.logger.debug("Removed .coding-agent before commit")
+                except Exception as e:
+                    self.logger.warning("Could not remove .coding-agent: %s", e)
+
+            # Also remove any stray files the agent may have left
+            for stray in ("cat", "test-output.txt", "test-output.txt;"):
+                stray_path = self.repo_path / stray
+                if stray_path.exists():
+                    try:
+                        stray_path.unlink()
+                    except Exception:
+                        pass
+
             self.repo.git.add(A=True)
             self.repo.git.commit(m=f"Agent: {task_id.replace('.txt', '')}")
             self.logger.info("Changes committed successfully")
+
+            # Recreate .coding-agent for subsequent tasks in the same run
+            workspace_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             self.logger.error(f"Failed to commit: {e}")
