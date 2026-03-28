@@ -83,6 +83,60 @@ class LLMManager:
             "LLM server detected as: %s at %s", self.server_type, self.base_url
         )
 
+        # Token usage tracking (cumulative per task)
+        self.usage_prompt_tokens = 0
+        self.usage_completion_tokens = 0
+        self.usage_total_tokens = 0
+        self.usage_call_count = 0
+
+    def reset_usage(self) -> None:
+        """Reset cumulative token counters (call at the start of each task)."""
+        self.usage_prompt_tokens = 0
+        self.usage_completion_tokens = 0
+        self.usage_total_tokens = 0
+        self.usage_call_count = 0
+
+    def get_usage_summary(self) -> str:
+        """Return a human-readable summary of token usage for the current task."""
+        return (
+            f"Token usage — prompt: {self.usage_prompt_tokens:,}, "
+            f"completion: {self.usage_completion_tokens:,}, "
+            f"total: {self.usage_total_tokens:,} "
+            f"({self.usage_call_count} LLM calls)"
+        )
+
+    def _track_usage(self, raw: Dict[str, Any]) -> None:
+        """Extract and accumulate token usage from an API response."""
+        self.usage_call_count += 1
+
+        # OpenAI format: {"usage": {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N}}
+        usage = raw.get("usage")
+        if isinstance(usage, dict):
+            prompt = usage.get("prompt_tokens", 0) or 0
+            completion = usage.get("completion_tokens", 0) or 0
+            total = usage.get("total_tokens", 0) or (prompt + completion)
+            self.usage_prompt_tokens += prompt
+            self.usage_completion_tokens += completion
+            self.usage_total_tokens += total
+            self.llm_logger.info(
+                "Tokens — prompt: %d, completion: %d, total: %d (cumulative: %d)",
+                prompt, completion, total, self.usage_total_tokens,
+            )
+            return
+
+        # Ollama format: {"prompt_eval_count": N, "eval_count": N}
+        prompt = raw.get("prompt_eval_count", 0) or 0
+        completion = raw.get("eval_count", 0) or 0
+        if prompt or completion:
+            total = prompt + completion
+            self.usage_prompt_tokens += prompt
+            self.usage_completion_tokens += completion
+            self.usage_total_tokens += total
+            self.llm_logger.info(
+                "Tokens — prompt: %d, completion: %d, total: %d (cumulative: %d)",
+                prompt, completion, total, self.usage_total_tokens,
+            )
+
     # ------------------------------------------------------------------
     # Retry wrapper for transient HTTP failures
     # ------------------------------------------------------------------
@@ -286,6 +340,7 @@ class LLMManager:
             response = self._call_ollama(messages, _req)
 
         text = response.text
+        self._track_usage(response.raw)
         self.llm_logger.info(f"RESPONSE:\n{text[:2000]}...")
         self.llm_logger.info("=" * 60)
         return text
@@ -323,6 +378,7 @@ class LLMManager:
             self.llm_logger.info(f"TEXT RESPONSE: {response.text[:1000]}...")
         else:
             self.llm_logger.info("EMPTY RESPONSE")
+        self._track_usage(response.raw)
         self.llm_logger.info("=" * 60)
 
         return response

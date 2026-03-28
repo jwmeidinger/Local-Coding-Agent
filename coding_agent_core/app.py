@@ -56,6 +56,18 @@ class CodingAgent:
     def close(self):
         """Cleanup resources and database connections."""
         self.logger.info("Cleaning up resources...")
+
+        # Clean up .coding-agent directories from repos
+        for repo_path in self.repos.keys():
+            workspace = repo_path / ".coding-agent"
+            if workspace.exists():
+                import shutil
+                try:
+                    shutil.rmtree(workspace)
+                    self.logger.debug(f"Removed .coding-agent from {repo_path}")
+                except Exception as e:
+                    self.logger.warning(f"Could not remove .coding-agent from {repo_path}: {e}")
+
         for repo_path, engine in self.engines.items():
             if engine.memory_manager:
                 try:
@@ -121,18 +133,20 @@ class CodingAgent:
         
         # Check central tasks directory first
         if self.config.tasks_dir.exists():
-            for task_file in self.config.tasks_dir.glob("*.txt"):
-                # Determine which repo this task belongs to
-                repo_path = self._determine_task_repo(task_file)
-                if repo_path:
-                    tasks.append((task_file, repo_path))
+            for task_file in sorted(self.config.tasks_dir.iterdir()):
+                if task_file.suffix in (".txt", ".md"):
+                    # Determine which repo this task belongs to
+                    repo_path = self._determine_task_repo(task_file)
+                    if repo_path:
+                        tasks.append((task_file, repo_path))
         
         # Also check each repo's tasks directory
         for repo_path in self.repos.keys():
             repo_tasks_dir = repo_path / "tasks"
             if repo_tasks_dir.exists():
-                for task_file in repo_tasks_dir.glob("*.txt"):
-                    tasks.append((task_file, repo_path))
+                for task_file in sorted(repo_tasks_dir.iterdir()):
+                    if task_file.suffix in (".txt", ".md"):
+                        tasks.append((task_file, repo_path))
         
         # Sort by modification time
         tasks.sort(key=lambda x: x[0].stat().st_mtime)

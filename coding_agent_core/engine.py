@@ -80,12 +80,25 @@ class ExecutionEngine:
             try:
                 data = _json.loads(pkg_json.read_text(encoding="utf-8"))
                 scripts = data.get("scripts", {})
+
+                # Words that indicate a script runs tests — never use as build_command
+                _test_indicators = ("test", "jest", "vitest", "mocha", "coverage", "spec")
+
+                def _is_test_script(script_body: str) -> bool:
+                    body_lower = script_body.lower()
+                    return any(w in body_lower for w in _test_indicators)
+
                 # Prefer fast check-only commands over full builds
-                preferred = ["typecheck", "check", "lint", "tsc", "build:check"]
+                preferred = ["typecheck", "type-check", "lint", "tsc", "build:check"]
                 for name in preferred:
-                    if name in scripts:
+                    if name in scripts and not _is_test_script(scripts[name]):
                         candidates.append((f"{pkg_manager} {name}", f'package.json "{name}"'))
-                if "build" in scripts:
+
+                # "check" is ambiguous — only use if it doesn't run tests
+                if "check" in scripts and not _is_test_script(scripts["check"]):
+                    candidates.append((f"{pkg_manager} check", 'package.json "check"'))
+
+                if "build" in scripts and not _is_test_script(scripts["build"]):
                     candidates.append((f"{pkg_manager} build", 'package.json "build"'))
             except Exception:
                 pass
@@ -123,11 +136,17 @@ class ExecutionEngine:
             candidates.append(("go build ./...", "go.mod detected"))
 
         if candidates:
-            self.logger.info("No --build-command set. Detected candidates:")
-            for cmd, source in candidates:
-                self.logger.info(f"  {cmd}  (from {source})")
             best = candidates[0][0]
-            self.logger.info(f'Pass --build-command="{best}" to enable auto-verify after edits')
+            self.config.build_command = best
+            self.logger.info(
+                "Auto-detected build command: %s (from %s). "
+                "Override with --build-command if needed.",
+                best, candidates[0][1],
+            )
+            if len(candidates) > 1:
+                self.logger.info("Other candidates:")
+                for cmd, source in candidates[1:]:
+                    self.logger.info(f"  {cmd}  (from {source})")
 
     def _get_project_summary(self) -> str:
         """Read key project config files and return a brief summary for context.
@@ -154,6 +173,13 @@ class ExecutionEngine:
                 if scripts:
                     script_list = ", ".join(f'"{k}"' for k in scripts.keys())
                     parts.append(f"Scripts: {script_list}")
+
+                    # Explicitly surface the test command so the agent doesn't guess
+                    if "test" in scripts:
+                        parts.append(
+                            f'Test command: `npm test -- <testFilePattern>` '
+                            f'(runs: {scripts["test"][:80]})'
+                        )
 
                 # Main entry point
                 for key in ("main", "module", "entry"):
@@ -262,6 +288,12 @@ class ExecutionEngine:
 
         # Ensure workspace directory exists (may have been cleaned up after previous task)
         self.config.workspace_dir.mkdir(parents=True, exist_ok=True)
+
+        # Ensure .coding-agent is in .git/info/exclude so it never gets committed
+        self._ensure_git_exclude()
+
+        # Reset token usage tracking for this task
+        self.llm.reset_usage()
         
         # Check for system upgrade attempts
         is_safe, reason, report = SystemUpgradeGuard.is_safe_task(task_description)
@@ -356,13 +388,28 @@ class ExecutionEngine:
         # Check for changes
         if not self._has_changes():
             self.logger.warning("No changes were made")
+            self.logger.info(self.llm.get_usage_summary())
             return False
         
         # Get list of modified files before committing
+        _stray_names = {
+            "cat", "test-output.txt", "test-output.txt;",
+            "test_output.txt", "jest_output.txt",
+            "temp-write-script.js",
+        }
         try:
             modified = self.repo.git.diff("--name-only").split('\n')
-            self.modified_files = [f.strip() for f in modified if f.strip()]
-            new_files = self.repo.untracked_files
+            self.modified_files = [
+                f.strip() for f in modified
+                if f.strip()
+                and not f.strip().startswith(".coding-agent")
+                and f.strip() not in _stray_names
+            ]
+            new_files = [
+                f for f in self.repo.untracked_files
+                if not f.startswith(".coding-agent")
+                and f not in _stray_names
+            ]
             self.modified_files.extend(new_files)
         except GitCommandError:
             self.modified_files = []
@@ -384,6 +431,9 @@ class ExecutionEngine:
             except Exception as e:
                 self.logger.warning(f"Failed to update memory: {e}")
         
+        # Log token usage summary for this task
+        self.logger.info(self.llm.get_usage_summary())
+
         return True
     
     def _create_abort_report(self, task_id: str, task_description: str, reason: str, report: str) -> None:
@@ -561,9 +611,10 @@ IMPORTANT RULES:
 - You are running on Windows. Use Windows-compatible paths and commands.
 - Do NOT use Unix paths like ./node_modules/.bin/jest or /c/Users/...
 - Use backslash paths or forward-slash relative paths: node_modules\\.bin\\jest.cmd
-- For npm/npx scripts, prefer: npx jest, npm test, npm run <script>
+- To run tests, ALWAYS use `npm test -- <testFilePattern>`. Do NOT use `npx jest` — it does not work on Windows.
 - Do NOT use shell pipes like | head, | tail, | grep — they are unreliable on Windows.
 - Do NOT use cd /c/... syntax — that is Git Bash Unix-style and won't work.
+- Do NOT chain commands with semicolons (;) or use $? — use separate bash calls instead.
 - Do NOT install packages (npm install <pkg>, pip install <pkg>, etc.) — only use what's already available.
 """
 
@@ -1034,6 +1085,17 @@ Begin working. Call your first tool now."""
         "ENOENT",  # Node file not found
     ]
 
+    # Patterns that indicate the build command is actually running tests,
+    # not doing a typecheck/lint. These are too slow and produce false failures.
+    _TEST_RUNNER_PATTERNS = [
+        "Test Suites:",   # Jest summary
+        "Tests:",         # Jest summary
+        "test-coverage",  # npm script name
+        "PASS src/",      # Jest pass line
+        "FAIL src/",      # Jest fail line
+        "% Stmts",        # Coverage table header
+    ]
+
     def _run_build_check(self) -> tuple[str, bool]:
         """Run the configured build command.
 
@@ -1051,13 +1113,25 @@ Begin working. Call your first tool now."""
                 shell=True,
                 cwd=self.repo_path,
                 capture_output=True,
-                text=True,
                 timeout=120,
+                encoding="utf-8",
+                errors="replace",
             )
+
+            output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+
+            # Detect if the "build" command is secretly running tests
+            if any(p in output for p in self._TEST_RUNNER_PATTERNS):
+                self.logger.warning(
+                    "Build command '%s' appears to be running tests, not typechecking. "
+                    "Disabling auto-verify. Use --build-command to set a fast typecheck.",
+                    self.config.build_command,
+                )
+                return output, True  # Treat as tool-broken to disable
+
             if result.returncode == 0:
                 return "", False
 
-            output = (result.stdout + "\n" + result.stderr).strip()
             if len(output) > 2000:
                 output = output[:2000] + "\n...(build output truncated)"
 
@@ -1185,23 +1259,57 @@ changes to that file. The agent's completion summary above explains its reasonin
         """Check if there are uncommitted changes."""
         return self.repo.is_dirty(untracked_files=True)
     
+    def _ensure_git_exclude(self) -> None:
+        """Ensure .coding-agent is excluded via .git/info/exclude (repo-local, never committed)."""
+        exclude_path = self.repo_path / ".git" / "info" / "exclude"
+        marker = ".coding-agent"
+
+        lines: list[str] = []
+        if exclude_path.exists():
+            try:
+                lines = exclude_path.read_text(encoding="utf-8").splitlines()
+            except Exception:
+                pass
+
+        # Already present — nothing to do
+        for line in lines:
+            stripped = line.strip()
+            if stripped == marker or stripped == f"/{marker}" or stripped == f"{marker}/":
+                return
+
+        # Append the entry
+        try:
+            exclude_path.parent.mkdir(parents=True, exist_ok=True)
+            with exclude_path.open("a", encoding="utf-8") as f:
+                # Ensure we start on a new line
+                if lines and lines[-1] != "":
+                    f.write("\n")
+                f.write(f"{marker}/\n")
+            self.logger.debug("Added .coding-agent/ to .git/info/exclude")
+        except Exception as e:
+            self.logger.warning("Could not update .git/info/exclude: %s", e)
+
     def _commit_changes(self, task_id: str) -> None:
         """Commit the changes, excluding agent workspace files."""
         try:
-            # Remove .coding-agent from the working tree before staging.
-            # This directory contains checkpoints, logs, and reports that
-            # should not be committed to the project's git history.
-            workspace_dir = self.repo_path / ".coding-agent"
-            if workspace_dir.exists():
-                import shutil
-                try:
-                    shutil.rmtree(workspace_dir)
-                    self.logger.debug("Removed .coding-agent before commit")
-                except Exception as e:
-                    self.logger.warning("Could not remove .coding-agent: %s", e)
+            import shutil
 
-            # Also remove any stray files the agent may have left
-            for stray in ("cat", "test-output.txt", "test-output.txt;"):
+            # 1. Ensure .coding-agent is git-excluded so it never gets committed
+            self._ensure_git_exclude()
+
+            # 2. If .coding-agent was previously tracked, untrack it
+            try:
+                self.repo.git.rm("-r", "--cached", ".coding-agent")
+                self.logger.debug("Untracked .coding-agent from git index")
+            except GitCommandError:
+                pass  # Not tracked — nothing to do
+
+            # 3. Remove stray files the agent may have left
+            for stray in (
+                "cat", "test-output.txt", "test-output.txt;",
+                "test_output.txt", "jest_output.txt",
+                "temp-write-script.js",
+            ):
                 stray_path = self.repo_path / stray
                 if stray_path.exists():
                     try:
@@ -1209,11 +1317,14 @@ changes to that file. The agent's completion summary above explains its reasonin
                     except Exception:
                         pass
 
+            # 4. Stage and commit
             self.repo.git.add(A=True)
-            self.repo.git.commit(m=f"Agent: {task_id.replace('.txt', '')}")
+            task_name = re.sub(r'\.(txt|md)$', '', task_id)
+            self.repo.git.commit(m=f"Agent: {task_name}")
             self.logger.info("Changes committed successfully")
 
-            # Recreate .coding-agent for subsequent tasks in the same run
+            # 5. Ensure workspace dir still exists for subsequent tasks
+            workspace_dir = self.repo_path / ".coding-agent"
             workspace_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             self.logger.error(f"Failed to commit: {e}")

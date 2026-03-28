@@ -42,7 +42,8 @@ When refactoring:
 - Understand the current behavior before changing
 - Make incremental changes
 - Run any available tests after each change
-- Explain the rationale for each refactoring decision""",
+- Explain the rationale for each refactoring decision
+- When finished, call done() IMMEDIATELY with your summary as the message argument. Do NOT write a text summary before calling done().""",
             planning_prompt="""Analyze the refactoring task and create a step-by-step plan:
 1. Identify the files that need to be refactored
 2. List specific issues to address (complexity, duplication, etc.)
@@ -79,7 +80,8 @@ When implementing:
 - Check existing code for patterns to follow
 - Keep changes focused on the requirement
 - Do not over-engineer - simple is better
-- Consider edge cases and error handling""",
+- Consider edge cases and error handling
+- When finished, call done() IMMEDIATELY with your summary as the message argument. Do NOT write a text summary before calling done().""",
             planning_prompt="""Analyze the feature request and create an implementation plan:
 1. What files need to be created or modified?
 2. What is the minimal implementation to satisfy the requirement?
@@ -117,7 +119,8 @@ When fixing bugs:
 - Reproduce the issue if possible
 - Fix the root cause, not symptoms
 - Test your fix
-- Consider edge cases""",
+- Consider edge cases
+- When finished, call done() IMMEDIATELY with your summary as the message argument. Do NOT write a text summary before calling done().""",
             planning_prompt="""Analyze the bug report and create a debugging plan:
 1. What files are likely involved?
 2. How can we reproduce or understand the issue?
@@ -153,7 +156,8 @@ When documenting:
 - Focus on clarity over completeness
 - Use examples where helpful
 - Keep documentation close to code
-- Update existing docs when code changes""",
+- Update existing docs when code changes
+- When finished, call done() IMMEDIATELY with your summary as the message argument. Do NOT write a text summary before calling done().""",
             planning_prompt="""Analyze the documentation task:
 1. What needs to be documented?
 2. What format should be used?
@@ -196,6 +200,8 @@ WORKFLOW — follow this order strictly:
 
 CRITICAL RULES:
 - Do NOT attempt to run tests before writing them — write first, verify after
+- When finished, call done() IMMEDIATELY. Do NOT write a text summary first —
+  put your summary in the done() message argument instead.
 - If a bash command returns "(no output)", do NOT retry the same command with
   different flags. The output capture may be unreliable. Move on and try a
   different approach (e.g. write the test file and run later, or skip to done).

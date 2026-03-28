@@ -277,7 +277,11 @@ class BashTool:
         
         These are unreliable on Windows (cmd.exe + Git Bash mix) and cause
         empty output. We handle truncation in Python instead.
+        Also strips shell chaining (;, &&) and redirects that cause issues on
+        Windows cmd.exe, as well as PowerShell-specific syntax.
         """
+        import sys
+
         # Strip trailing pipes to head/tail/cat/grep (common truncation patterns)
         # Be careful not to strip meaningful pipes (e.g., command1 | command2)
         cleaned = re.sub(
@@ -287,6 +291,50 @@ class BashTool:
         )
         # Also strip "2>&1" — we capture both streams in Python
         cleaned = re.sub(r'\s*2>&1\s*', ' ', cleaned).strip()
+
+        if sys.platform == "win32":
+            # Strip shell chaining after the main command:
+            # "npm test -- foo; echo $?" → "npm test -- foo"
+            # "npm test -- foo > out.txt; echo done" → "npm test -- foo"
+            cleaned = re.sub(r'\s*;\s*.*$', '', cleaned).strip()
+
+            # Strip file redirects: "> file.txt", ">> file.txt"
+            cleaned = re.sub(r'\s*>>?\s*\S+\s*$', '', cleaned).strip()
+
+            # Strip PowerShell pipes: "| Select-Object ..."
+            cleaned = re.sub(
+                r'\s*\|\s*Select-Object.*$', '', cleaned, flags=re.IGNORECASE
+            ).strip()
+
+            # Strip bash-style env prefix: "CI=true node ..." → "node ..."
+            # (already set via env dict in execute())
+            cleaned = re.sub(
+                r'^(\w+=\S+\s+)+', '', cleaned
+            ).strip()
+
+            # Convert ./node_modules/.bin/X → npx X (dot-slash doesn't work on cmd.exe)
+            cleaned = re.sub(
+                r'^\./node_modules/\.bin/', 'npx ', cleaned
+            ).strip()
+
+            # Convert node node_modules/jest/bin/jest.js → npm test
+            jest_node_match = re.match(
+                r'^node\s+node_modules[/\\]jest[/\\]bin[/\\]jest\.js\s*(.*)',
+                cleaned, re.IGNORECASE
+            )
+            if jest_node_match:
+                jest_args = jest_node_match.group(1).strip()
+                cleaned = f"npm test -- {jest_args}" if jest_args else "npm test"
+
+            # Convert npx jest → npm test (npx jest produces no output on Windows)
+            # This runs AFTER ./node_modules conversion so both paths are covered
+            npx_jest_match = re.match(
+                r'^npx\s+jest\s*(.*)', cleaned, re.IGNORECASE
+            )
+            if npx_jest_match:
+                jest_args = npx_jest_match.group(1).strip()
+                cleaned = f"npm test -- {jest_args}" if jest_args else "npm test"
+
         return cleaned
 
     def execute(self, command: str) -> str:
@@ -324,10 +372,11 @@ class BashTool:
                 cwd=self.cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,    # Capture stderr separately
-                text=True,
                 timeout=timeout,
                 stdin=subprocess.DEVNULL,
                 env=env,
+                encoding="utf-8",
+                errors="replace",          # Replace unmappable chars instead of crashing
             )
             stdout = result.stdout.strip() if result.stdout else ""
             stderr = result.stderr.strip() if result.stderr else ""
@@ -1366,6 +1415,20 @@ class ToolRegistry:
                 filtered = {k: v for k, v in kwargs.items() if k in valid_params}
             else:
                 filtered = kwargs
+
+            # Check for missing required parameters before calling
+            required_params = {
+                k for k, p in sig.parameters.items()
+                if p.default is inspect.Parameter.empty
+                and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+                and k != "self"
+            }
+            missing = required_params - set(filtered.keys())
+            if missing:
+                return (
+                    f"Error: {name}() missing required argument(s): {', '.join(sorted(missing))}. "
+                    f"Please retry with all required parameters: {', '.join(sorted(required_params))}"
+                )
 
             # Convert all values to strings for tools that expect string args
             # (e.g. start_line="50" vs start_line=50)
