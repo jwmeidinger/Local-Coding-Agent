@@ -11,7 +11,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 try:
-    from vector_memory import VectorMemoryManager, get_db_url
+    from .vector_memory import VectorMemoryManager, get_db_url
     VECTOR_MEMORY_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional dependency
     VectorMemoryManager = None

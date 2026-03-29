@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS task_memory (
     skill_used TEXT,
     files_modified TEXT[],
     execution_log TEXT,
+    outcome TEXT DEFAULT 'unknown',
+    failure_type TEXT,
+    failure_summary TEXT,
+    resolution TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     embedding VECTOR(1536),
     UNIQUE(task_id)

@@ -154,6 +154,10 @@ class VectorMemoryManager:
                     skill_used TEXT,
                     files_modified TEXT[],
                     execution_log TEXT,
+                    outcome TEXT DEFAULT 'unknown',
+                    failure_type TEXT,
+                    failure_summary TEXT,
+                    resolution TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     embedding VECTOR({self.embed_dims}),
                     UNIQUE(task_id)
@@ -163,6 +167,23 @@ class VectorMemoryManager:
                 CREATE INDEX IF NOT EXISTS task_memory_hnsw_idx
                 ON task_memory USING hnsw (embedding vector_cosine_ops);
             """)
+
+            # Migrate existing tables: add columns if missing
+            for col, col_type, col_default in [
+                ("outcome", "TEXT", "'unknown'"),
+                ("failure_type", "TEXT", "NULL"),
+                ("failure_summary", "TEXT", "NULL"),
+                ("resolution", "TEXT", "NULL"),
+            ]:
+                cur.execute("""
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'task_memory' AND column_name = %s
+                """, (col,))
+                if cur.fetchone() is None:
+                    cur.execute(
+                        f"ALTER TABLE task_memory ADD COLUMN {col} {col_type} DEFAULT {col_default}"
+                    )
+                    self.logger.info("Migrated task_memory: added column %s", col)
 
             self.conn.commit()
             self.logger.info(
@@ -469,11 +490,14 @@ class VectorMemoryManager:
         task_description: str,
         branch_name: str,
         skill_used: str,
-        embedding_model: Any = None
+        embedding_model: Any = None,
+        outcome: str = "unknown",
+        failure_type: Optional[str] = None,
+        failure_summary: Optional[str] = None,
+        resolution: Optional[str] = None,
+        execution_log: Optional[str] = None,
     ):
         """Update memory after a task modifies files."""
-        self.logger.info(f"Updating memory for {len(modified_files)} modified files")
-        
         repo_str = str(self.repo_path)
         
         # Re-index modified files
@@ -560,11 +584,15 @@ class VectorMemoryManager:
                 with self.conn.cursor() as cur:
                     cur.execute("""
                         INSERT INTO task_memory 
-                        (task_id, repo_path, task_description, branch_name, skill_used, files_modified, embedding)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        (task_id, repo_path, task_description, branch_name, skill_used,
+                         files_modified, embedding, outcome, failure_type,
+                         failure_summary, resolution, execution_log)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         task_id, repo_str, task_description, branch_name, 
-                        skill_used, modified_files, task_embedding
+                        skill_used, modified_files, task_embedding,
+                        outcome, failure_type, failure_summary, resolution,
+                        execution_log,
                     ))
             except Exception as e:
                 self.logger.warning(f"Failed to store task memory: {e}")
@@ -584,6 +612,11 @@ class VectorMemoryManager:
                     branch_name,
                     skill_used,
                     files_modified,
+                    outcome,
+                    failure_type,
+                    failure_summary,
+                    resolution,
+                    execution_log,
                     created_at,
                     1 - (embedding <=> %s::vector) AS similarity
                 FROM task_memory
@@ -594,6 +627,74 @@ class VectorMemoryManager:
             """, (query_embedding, str(self.repo_path), query_embedding, limit))
             
             return [dict(row) for row in cur.fetchall()]
+
+    def find_similar_failures(
+        self,
+        failure_type: str,
+        query: str,
+        embedding_model: Any = None,
+        limit: int = 3,
+    ) -> List[Dict]:
+        """Find past runs that had the same failure type, ranked by similarity."""
+        query_embedding = self._generate_embedding(query, embedding_model)
+
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    task_id,
+                    task_description,
+                    files_modified,
+                    outcome,
+                    failure_type,
+                    failure_summary,
+                    resolution,
+                    execution_log,
+                    created_at,
+                    1 - (embedding <=> %s::vector) AS similarity
+                FROM task_memory
+                WHERE repo_path = %s
+                AND failure_type = %s
+                AND embedding IS NOT NULL
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (query_embedding, str(self.repo_path), failure_type, query_embedding, limit))
+
+            return [dict(row) for row in cur.fetchall()]
+
+    @staticmethod
+    def format_past_runs(runs: List[Dict], max_runs: int = 3) -> str:
+        """Format past run records into a concise summary for LLM context.
+
+        Keeps the output short — max ~300 tokens worth of text.
+        """
+        if not runs:
+            return ""
+
+        lines = ["## Relevant Past Runs"]
+        for run in runs[:max_runs]:
+            outcome = run.get("outcome", "unknown")
+            desc = (run.get("task_description") or "")[:80]
+            files = run.get("files_modified") or []
+            files_str = ", ".join(files[:4])
+            if len(files) > 4:
+                files_str += f" (+{len(files) - 4} more)"
+
+            lines.append(f"\n- **{outcome.upper()}**: {desc}")
+            if files_str:
+                lines.append(f"  Files: {files_str}")
+            if run.get("failure_summary"):
+                lines.append(f"  Failure: {run['failure_summary'][:120]}")
+            if run.get("resolution"):
+                lines.append(f"  Fix: {run['resolution'][:120]}")
+            if run.get("execution_log"):
+                # Show the last few steps — these are the most informative
+                log_lines = run["execution_log"].strip().splitlines()
+                # Take up to last 5 steps, truncating each
+                tail = log_lines[-5:] if len(log_lines) > 5 else log_lines
+                steps_str = "; ".join(s.strip()[:60] for s in tail)
+                lines.append(f"  Steps: {steps_str}")
+
+        return "\n".join(lines) + "\n"
     
     def _extract_functions(self, content: str, ext: str) -> List[str]:
         """Extract function/class names from source code."""

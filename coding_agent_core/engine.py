@@ -7,6 +7,14 @@ from pathlib import Path
 
 from .config import AgentConfig, SystemContext, TaskContext
 from .deps import GitCommandError, VECTOR_MEMORY_AVAILABLE, VectorMemoryManager
+from .failure_classifier import (
+    FailureInfo,
+    FailureTracker,
+    classify_failure,
+    classify_review_rejection,
+    get_retry_guidance,
+    _normalize_signature,
+)
 from .llm import ChatResponse, LLMManager, ToolCall
 from .skills import Skill, SkillRegistry
 from .tools import SystemUpgradeGuard, ToolRegistry
@@ -336,13 +344,36 @@ class ExecutionEngine:
         skill = self.skills.detect_skill(task_description)
         self.logger.info(f"Using skill: {skill.name}")
         
+        # Initialize failure tracker for stop-condition detection
+        failure_tracker = FailureTracker(max_repeats=3)
+        task_passed = False
+        
         # Execution loop
         for iteration in range(1, self.config.max_iterations + 1):
             context.iteration = iteration
             self.logger.info(f"Iteration {iteration}/{self.config.max_iterations}")
             
-            # Plan
+            # Plan (or replan after feedback)
             if not context.plan or context.review_feedback:
+                # On replan after failure, retrieve similar past failures
+                if context.review_feedback and self.memory_manager and failure_tracker.last:
+                    try:
+                        ft = failure_tracker.last.failure_type
+                        similar_failures = self.memory_manager.find_similar_failures(
+                            ft, context.task_description, limit=2
+                        )
+                        if similar_failures:
+                            past_ctx = self.memory_manager.format_past_runs(similar_failures)
+                            context.review_feedback += (
+                                f"\n\n{past_ctx}"
+                            )
+                            self.logger.info(
+                                "Injected %d similar past failures into replan context",
+                                len(similar_failures),
+                            )
+                    except Exception as e:
+                        self.logger.warning(f"Past-failure retrieval failed: {e}")
+
                 context.plan = self._create_plan(context, skill)
                 self.logger.info(f"Plan created:\n{context.plan}")
             
@@ -350,6 +381,26 @@ class ExecutionEngine:
             success = self._execute_plan(context, skill)
             if not success:
                 self.logger.warning(f"Execution failed on iteration {iteration}")
+                # Surface inner-loop failure context to the replan
+                # Look for STUCK entries in the execution log
+                stuck_entries = [
+                    e for e in context.execution_log if e.startswith("STUCK:")
+                ]
+                if stuck_entries:
+                    stuck_summary = "\n".join(stuck_entries[-3:])
+                    context.review_feedback = (
+                        f"The previous iteration was aborted because the agent got "
+                        f"stuck in a loop:\n{stuck_summary}\n\n"
+                        f"## Strategy for this iteration\n"
+                        f"1. Use web_search to look up the specific framework/mocking "
+                        f"issue (e.g. 'jest mock axios isAxiosError', "
+                        f"'jest fake timers nested setTimeout async')\n"
+                        f"2. If specific tests keep failing after a genuine attempt, "
+                        f"REMOVE or SKIP those tests with `it.skip(...)` and add a "
+                        f"TODO comment explaining why. Passing 20/24 tests is better "
+                        f"than failing all 24.\n"
+                        f"3. Do NOT repeat the same approach that failed last time."
+                    )
                 continue
             
             # Skip review if nothing was written — go straight to next iteration
@@ -374,20 +425,83 @@ class ExecutionEngine:
             
             if self._review_passed(review_result):
                 self.logger.info("Task passed review")
+                task_passed = True
                 break
             else:
-                context.review_feedback = review_result
+                # Classify the review rejection
+                failure_info = classify_review_rejection(review_result)
+                should_stop = failure_tracker.record(failure_info)
+
+                # Build targeted feedback: review text + retry guidance
+                guidance = get_retry_guidance(failure_info.failure_type)
+                context.review_feedback = (
+                    f"{review_result}\n\n"
+                    f"## Retry guidance\n{guidance}"
+                )
+
                 if self.config.verbose:
                     self.logger.info(f"Review feedback:\n{review_result}")
                 else:
                     self.logger.info(f"Review feedback: {review_result[:200]}...")
+
+                if should_stop:
+                    self.logger.warning(
+                        "Stopping: same failure repeated %d times without improvement "
+                        "(type=%s)", failure_tracker.max_repeats,
+                        failure_info.failure_type,
+                    )
+                    break
                 if iteration >= self.config.max_iterations:
                     self.logger.warning("Max iterations reached without PASS")
                     break
         
+        # --- Determine outcome for memory ---
+        if task_passed:
+            outcome = "success"
+        elif self._has_changes():
+            outcome = "partial"
+        else:
+            outcome = "failure"
+
+        fail_type, fail_summary = failure_tracker.summary_for_storage()
+
+        # Build a meaningful resolution string
+        resolution = None
+        if task_passed and fail_type:
+            # The task passed after failures — capture what fixed it
+            parts = [f"Passed after {len(failure_tracker._history)} failure(s)."]
+            if context.done_message:
+                # Truncate the done message to the most useful bit
+                done_short = context.done_message.strip().splitlines()[0][:120]
+                parts.append(f"Agent summary: {done_short}")
+            resolution = " ".join(parts)
+
+        # Build a summarized execution log for storage
+        # Keep the last 8 steps, each truncated — enough to understand
+        # the approach without blowing up storage
+        exec_log_summary = None
+        if context.execution_log:
+            tail = context.execution_log[-8:]
+            log_lines = [entry[:100] for entry in tail]
+            exec_log_summary = "\n".join(log_lines)
+            # Cap at ~1000 chars total
+            if len(exec_log_summary) > 1000:
+                exec_log_summary = exec_log_summary[:1000] + "\n...(truncated)"
+
         # Check for changes
         if not self._has_changes():
             self.logger.warning("No changes were made")
+            # Still record the failed attempt in memory
+            if self.memory_manager:
+                try:
+                    self.memory_manager.update_for_task(
+                        [], task_description, self.current_branch, skill.name,
+                        outcome=outcome, failure_type=fail_type,
+                        failure_summary=fail_summary,
+                        execution_log=exec_log_summary,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Failed to update memory: {e}")
             self.logger.info(self.llm.get_usage_summary())
             return False
         
@@ -418,15 +532,20 @@ class ExecutionEngine:
         if self.config.auto_commit:
             self._commit_changes(task_id)
         
-        # Update memory with modified files
-        if self.modified_files and self.memory_manager:
+        # Update memory with modified files and outcome
+        if self.memory_manager:
             self.logger.info(f"Updating memory for {len(self.modified_files)} modified files")
             try:
                 self.memory_manager.update_for_task(
                     self.modified_files,
                     task_description,
                     self.current_branch,
-                    skill.name
+                    skill.name,
+                    outcome=outcome,
+                    failure_type=fail_type,
+                    failure_summary=fail_summary,
+                    resolution=resolution,
+                    execution_log=exec_log_summary,
                 )
             except Exception as e:
                 self.logger.warning(f"Failed to update memory: {e}")
@@ -522,12 +641,29 @@ class ExecutionEngine:
             except Exception as e:
                 self.logger.warning(f"Vector search failed: {e}")
 
+        # Retrieve similar past runs for context
+        past_runs_context = ""
+        if self.memory_manager:
+            try:
+                past_runs = self.memory_manager.find_similar_tasks(
+                    context.task_description, limit=3
+                )
+                # Only include runs with meaningful similarity
+                relevant = [r for r in past_runs if r.get("similarity", 0) > 0.3]
+                if relevant:
+                    past_runs_context = self.memory_manager.format_past_runs(relevant)
+                    self.logger.info(
+                        "Found %d relevant past runs for planning", len(relevant)
+                    )
+            except Exception as e:
+                self.logger.warning(f"Past-run retrieval failed: {e}")
+
         prompt = f"""{context.system_info}
 
 ## Project File Tree (REAL — use only these paths)
 {file_tree}
 
-{context_info}{skill.planning_prompt.format(task_description=context.task_description)}
+{context_info}{past_runs_context}{skill.planning_prompt.format(task_description=context.task_description)}
 
 IMPORTANT RULES:
 - You may ONLY reference files/directories that appear in the file tree above.
@@ -702,6 +838,27 @@ Begin working. Call your first tool now."""
         web_search_queries: list[str] = []
         MAX_WEB_SEARCHES = 3
 
+        # Inner-loop failure tracker — detects repeated tool-level failures
+        # within a single _execute_plan invocation
+        inner_tracker = FailureTracker(max_repeats=3)
+        MAX_EDIT_FAILURES = 4  # Stop nudging after this many file_edit errors
+
+        # Test run tracking — detects edit→test→fail→edit→test→fail loops
+        test_run_count = 0           # Total test invocations
+        failed_test_runs = 0         # Consecutive failed test runs
+        last_test_failure_sig = ""   # Normalized signature of last test failure
+        MAX_TEST_RUNS = 4            # Cap on test invocations per execution
+        edits_since_last_test = 0    # Track edits between test runs
+        MAX_EDITS_BEFORE_TEST = 4    # Nudge to test after this many edits
+
+        # Pre-compiled patterns for detecting test failures in bash output
+        _JEST_FAIL_PATTERNS = [
+            re.compile(r"FAIL\s+\S+", re.IGNORECASE),
+            re.compile(r"Tests:\s+\d+ failed", re.IGNORECASE),
+            re.compile(r"Test Suites:.*failed", re.IGNORECASE),
+            re.compile(r"FAILED", re.IGNORECASE),
+        ]
+
         # Step budget thresholds for escalating write nudges
         NUDGE_SOFT = int(max_steps * 0.5)
         NUDGE_HARD = int(max_steps * 0.75)
@@ -730,6 +887,17 @@ Begin working. Call your first tool now."""
                         f"Note: You have used {step} of {max_steps} steps. "
                         f"Start making changes with file_edit soon."
                     )
+                messages.append({"role": "user", "content": nudge})
+
+            # --- Nudge if too many edits without running tests ---
+            # Only fires after at least one failed test run (agent is in fix loop)
+            if (failed_test_runs > 0
+                    and edits_since_last_test >= MAX_EDITS_BEFORE_TEST):
+                nudge = (
+                    f"You have made {edits_since_last_test} edits since the last "
+                    f"test run. Run tests now to verify your changes before "
+                    f"making more edits."
+                )
                 messages.append({"role": "user", "content": nudge})
 
             # --- Manage context window: summarize old tool results ---
@@ -902,6 +1070,7 @@ Begin working. Call your first tool now."""
             if is_mutation:
                 write_count += 1
                 write_attempts += 1
+                edits_since_last_test += 1
 
             # --- Execute the tool ---
             result = self.tools.execute_by_name(tc.name, tc.arguments)
@@ -915,8 +1084,197 @@ Begin working. Call your first tool now."""
                 )
                 grep_cache[grep_key] = result
 
+            # --- Classify inner-loop failures from tool results ---
+            tool_had_error = False
+            if is_mutation and "Error" in result:
+                # file_edit / file_write returned an error (e.g. text not found)
+                tool_failure = classify_failure(result)
+                should_stop_inner = inner_tracker.record(tool_failure)
+                tool_had_error = True
+
+                if should_stop_inner:
+                    self.logger.warning(
+                        "Inner loop: same tool error repeated %d times (type=%s). "
+                        "Aborting execution for this iteration.",
+                        inner_tracker.max_repeats, tool_failure.failure_type,
+                    )
+                    result += (
+                        "\n\n⛔ This same error has occurred multiple times. "
+                        "Re-read the file to get the current exact content, "
+                        "then try a different approach."
+                    )
+                    self._append_tool_call_messages(messages, response, result)
+                    # Surface inner-loop failure info to the outer loop
+                    context.execution_log.append(
+                        f"STUCK: {tool_failure.failure_type} — {tool_failure.summary[:100]}"
+                    )
+                    return False
+
+                # Inject targeted guidance on repeated (but not yet stuck) failures
+                if inner_tracker._seen.get(
+                    (tool_failure.failure_type, 
+                     _normalize_signature(tool_failure.summary)), 0
+                ) >= 2:
+                    guidance = get_retry_guidance(tool_failure.failure_type)
+                    result += f"\n\n## Retry guidance\n{guidance}"
+
+            elif tc.name == "bash":
+                cmd = tc.arguments.get("command", "").lower()
+                is_test_run = any(kw in cmd for kw in [
+                    "npm test", "npx jest", "pytest", "python -m pytest",
+                    "cargo test", "go test", "mvn test", "gradle test",
+                ])
+
+                if is_test_run:
+                    test_run_count += 1
+                    edits_since_last_test = 0
+
+                    # Detect test failure from output
+                    test_failed = any(pat.search(result) for pat in _JEST_FAIL_PATTERNS)
+
+                    if test_failed:
+                        test_failure = classify_failure(result)
+                        inner_tracker.record(test_failure)
+                        current_sig = _normalize_signature(test_failure.summary)
+                        same_as_last = (current_sig == last_test_failure_sig)
+                        last_test_failure_sig = current_sig
+                        failed_test_runs += 1
+
+                        # Parse test pass/fail counts from output
+                        tests_passed = 0
+                        tests_failed_count = 0
+                        tests_total = 0
+                        count_match = re.search(
+                            r"Tests:\s+(\d+)\s+failed.*?(\d+)\s+passed.*?(\d+)\s+total",
+                            result
+                        )
+                        if not count_match:
+                            # Try pytest format: "X passed, Y failed"
+                            count_match = re.search(
+                                r"(\d+)\s+passed.*?(\d+)\s+failed",
+                                result
+                            )
+                            if count_match:
+                                tests_passed = int(count_match.group(1))
+                                tests_failed_count = int(count_match.group(2))
+                                tests_total = tests_passed + tests_failed_count
+                        else:
+                            tests_failed_count = int(count_match.group(1))
+                            tests_passed = int(count_match.group(2))
+                            tests_total = int(count_match.group(3))
+
+                        pass_rate = (
+                            tests_passed / tests_total if tests_total > 0 else 0
+                        )
+
+                        if same_as_last and failed_test_runs >= 3:
+                            # Same test failure 3+ times — force a different approach
+                            self.logger.warning(
+                                "Test failure repeated %d times with same error. "
+                                "Injecting re-read guidance.",
+                                failed_test_runs,
+                            )
+                            # Allow re-reading source files — the agent NEEDS to
+                            # re-read to break out of the loop. Clear the dedup set.
+                            files_already_read.clear()
+                            self.logger.info(
+                                "Cleared file read cache to allow re-reading after "
+                                "repeated test failures."
+                            )
+                            # Unlock web search — the agent is stuck on a pattern
+                            # it can't figure out from the codebase alone
+                            web_search_queries.clear()
+                            MAX_WEB_SEARCHES = max(MAX_WEB_SEARCHES, 2)
+                            self.logger.info(
+                                "Unlocked web search (limit=%d, cleared query cache) "
+                                "after repeated test failures.",
+                                MAX_WEB_SEARCHES,
+                            )
+                            result += (
+                                "\n\n⛔ SAME TEST FAILURE %d TIMES IN A ROW. "
+                                "Your previous edits are NOT fixing the root cause.\n"
+                                "STOP editing and do the following:\n"
+                                "1. Use web_search to look up the specific error message "
+                                "or testing pattern that is failing — search for the "
+                                "framework name + the error (web search limit has been "
+                                "increased)\n"
+                                "2. Use file_read to re-read the SOURCE file being tested "
+                                "— the read cache has been cleared so you can re-read it\n"
+                                "3. If mocking is the issue, look at how other test files "
+                                "in this project mock the same dependency\n"
+                                "4. If specific tests STILL fail after trying a new "
+                                "approach, use the test framework's skip mechanism to "
+                                "skip them and add a TODO comment — passing most tests "
+                                "is better than failing all"
+                                % failed_test_runs
+                            )
+                        elif same_as_last and failed_test_runs >= 2:
+                            # Same failure twice — inject guidance
+                            guidance = get_retry_guidance(test_failure.failure_type)
+                            result += (
+                                f"\n\n⚠ This is the same test failure as last time. "
+                                f"Your last edit did not fix it.\n"
+                                f"## What to do differently\n{guidance}\n"
+                                f"Consider re-reading the source file to understand "
+                                f"what the code actually does before editing the test again."
+                            )
+                    else:
+                        # Tests passed — reset failure tracking
+                        failed_test_runs = 0
+                        last_test_failure_sig = ""
+
+                    # Cap total test runs to prevent burn
+                    if test_run_count >= MAX_TEST_RUNS and failed_test_runs > 0:
+                        # Check if most tests pass — partial success is better
+                        # than total failure
+                        if pass_rate >= 0.8 and tests_passed > 0:
+                            self.logger.info(
+                                "Partial success: %d/%d tests passing (%.0f%%). "
+                                "Instructing agent to skip failing tests and commit.",
+                                tests_passed, tests_total, pass_rate * 100,
+                            )
+                            result += (
+                                f"\n\n✅ PARTIAL SUCCESS: {tests_passed}/{tests_total} "
+                                f"tests are passing ({pass_rate:.0%}).\n"
+                                f"You have been unable to fix the remaining "
+                                f"{tests_failed_count} test(s) after {test_run_count} attempts.\n"
+                                f"DO THIS NOW:\n"
+                                f"1. Use file_edit to mark ONLY the failing tests as "
+                                f"skipped using the test framework's skip mechanism "
+                                f"— do NOT remove them\n"
+                                f"2. Add a TODO comment on each skipped test explaining "
+                                f"why it was skipped and what needs manual review\n"
+                                f"3. Run tests ONE more time to confirm all pass\n"
+                                f"4. Call done() with a summary noting which tests "
+                                f"were skipped and why"
+                            )
+                            # Give the agent more steps to do the skip+verify
+                            MAX_TEST_RUNS += 1
+                        else:
+                            self.logger.warning(
+                                "Test run limit reached (%d runs, %d consecutive failures). "
+                                "Aborting inner loop to trigger replan.",
+                                test_run_count, failed_test_runs,
+                            )
+                            result += (
+                                f"\n\n⛔ You have run tests {test_run_count} times with "
+                                f"{failed_test_runs} consecutive failures. "
+                                f"Aborting this iteration to try a different approach."
+                            )
+                            self._append_tool_call_messages(messages, response, result)
+                            context.execution_log.append(
+                                f"STUCK: test loop — {test_run_count} runs, "
+                                f"{failed_test_runs} failures, last: {last_test_failure_sig[:80]}"
+                            )
+                            return False
+
+                elif "Error" in result and "error" in result.lower():
+                    # Non-test bash command failed — classify for tracking
+                    bash_failure = classify_failure(result)
+                    inner_tracker.record(bash_failure)
+
             # --- Auto-verify after mutations ---
-            if is_mutation and "Error" not in result and build_verify_enabled:
+            if is_mutation and not tool_had_error and build_verify_enabled:
                 verify_output, is_tool_broken = self._run_build_check()
                 if is_tool_broken:
                     # The build tool itself can't run (PATH issue, missing binary, etc.)
@@ -937,19 +1295,58 @@ Begin working. Call your first tool now."""
                     written_path = tc.arguments.get("path", "")
                     if written_path:
                         revert_result = self.tools.execute_by_name("revert_file", {"path": written_path})
+
+                        # Classify the build failure for targeted guidance
+                        build_failure = classify_failure(verify_output)
+                        should_stop_inner = inner_tracker.record(build_failure)
+                        guidance = get_retry_guidance(build_failure.failure_type)
+                        file_hint = ""
+                        if build_failure.file_hint and build_failure.line_hint:
+                            file_hint = (
+                                f"\nError location: {build_failure.file_hint}"
+                                f" line {build_failure.line_hint}"
+                            )
+                        elif build_failure.file_hint:
+                            file_hint = f"\nError location: {build_failure.file_hint}"
+
                         result += (
                             f"\n\n⚠ BUILD FAILED after this change — file has been auto-reverted.\n"
+                            f"Failure type: {build_failure.failure_type}\n"
                             f"Build output:\n{verify_output}\n"
-                            f"Revert: {revert_result}\n"
-                            f"Fix the issue and try again."
+                            f"Revert: {revert_result}{file_hint}\n\n"
+                            f"## What to do next\n{guidance}"
                         )
                         write_count -= 1
-                        self.logger.warning("Auto-reverted %s after build failure", written_path)
+                        self.logger.warning(
+                            "Auto-reverted %s after build failure (type=%s)",
+                            written_path, build_failure.failure_type,
+                        )
+
+                        if should_stop_inner:
+                            self.logger.warning(
+                                "Inner loop: same build failure repeated %d times. "
+                                "Aborting execution for this iteration.",
+                                inner_tracker.max_repeats,
+                            )
+                            context.execution_log.append(
+                                f"STUCK: {build_failure.failure_type} — {build_failure.summary[:100]}"
+                            )
+                            self._append_tool_call_messages(messages, response, result)
+                            return False
 
             if self.config.verbose:
                 self.logger.info(f"Result:\n{result}")
             else:
-                self.logger.info(f"Result: {result[:200]}...")
+                # For bash commands, show the last 10 lines (test summaries,
+                # error messages, etc. are always at the end)
+                if tc.name == "bash" and len(result) > 200:
+                    tail_lines = result.rstrip().splitlines()[-10:]
+                    tail_text = "\n".join(tail_lines)
+                    self.logger.info(
+                        f"Result (last 10 lines):\n{tail_text}"
+                    )
+                else:
+                    self.logger.info(f"Result: {result[:200]}...")
 
             if "not found" in result.lower():
                 result += "\n\nIMPORTANT: Use file_tree or list_files to find the correct path."
@@ -1108,6 +1505,9 @@ Begin working. Call your first tool now."""
             return "", False
         try:
             import subprocess
+            self.logger.info(
+                "Running build check: %s", self.config.build_command
+            )
             result = subprocess.run(
                 self.config.build_command,
                 shell=True,
@@ -1142,7 +1542,14 @@ Begin working. Call your first tool now."""
             return output, is_tool_broken
 
         except subprocess.TimeoutExpired:
-            return "Build command timed out after 120 seconds", False
+            self.logger.warning(
+                "Build command timed out after 120s: %s",
+                self.config.build_command,
+            )
+            return (
+                f"Build command timed out after 120 seconds: "
+                f"{self.config.build_command}"
+            ), True
         except FileNotFoundError:
             return f"Build command not found: {self.config.build_command}", True
         except Exception as e:
