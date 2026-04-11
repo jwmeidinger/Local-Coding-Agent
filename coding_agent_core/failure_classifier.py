@@ -51,6 +51,28 @@ _SYNTAX_PATTERNS: list[re.Pattern] = [
     re.compile(r"IndentationError:", re.IGNORECASE),
     re.compile(r"Unexpected token", re.IGNORECASE),
     re.compile(r"Parsing error:", re.IGNORECASE),
+    # Go compiler errors
+    re.compile(r"^#\s+\S+\s*$", re.MULTILINE),          # "# package/path" header in go build output
+    re.compile(r"\bundefined:\s+\w+", re.IGNORECASE),    # "undefined: someVar"
+    re.compile(r"expected statement, found"),              # invalid placeholder like "..."
+    re.compile(r"syntax error: unexpected"),               # generic Go syntax error
+    re.compile(r"imported and not used:", re.IGNORECASE), # Go: unused import
+    re.compile(r"declared and not used:", re.IGNORECASE), # Go: unused variable
+    re.compile(r"cannot use .+ as .+type", re.IGNORECASE),   # Go: type mismatch
+    re.compile(r"cannot convert .+ to type", re.IGNORECASE), # Go: type conversion error
+    re.compile(r"missing return at end of function"),         # Go: missing return
+    re.compile(r"not enough (arguments|return values)"),      # Go: wrong arg count
+    re.compile(r"too many (arguments|return values)"),        # Go: wrong arg count
+    re.compile(r"cannot index\b", re.IGNORECASE),             # Go: indexing a non-slice/map
+    re.compile(r"has no field or method\b", re.IGNORECASE),  # Go: wrong field/method name
+    re.compile(r"cannot take the address of", re.IGNORECASE), # Go: addressability error
+    re.compile(r"invalid operation:.*\(", re.IGNORECASE),     # Go: generic invalid op
+    re.compile(r"multiple-value .* used in single-value context", re.IGNORECASE),
+    re.compile(r"non-name .* on left side of :=", re.IGNORECASE),
+    re.compile(r"invalid append:", re.IGNORECASE),              # Go: append to non-slice (e.g. *[]T)
+    re.compile(r"argument must be a slice", re.IGNORECASE),     # Go: append wrong type
+    re.compile(r"cannot assign to .+\(.*not addressable\)", re.IGNORECASE),  # Go: non-addressable
+    re.compile(r"must be a slice type", re.IGNORECASE),         # Go: range/append on pointer
 ]
 
 _TEST_PATTERNS: list[re.Pattern] = [
@@ -96,6 +118,13 @@ _DEPENDENCY_PATTERNS: list[re.Pattern] = [
     re.compile(r"Could not resolve dependency", re.IGNORECASE),
     re.compile(r"ENOENT.*package\.json", re.IGNORECASE),
     re.compile(r"pip install", re.IGNORECASE),
+    # Go module errors
+    re.compile(r"no required module provides", re.IGNORECASE),
+    re.compile(r"cannot find package .* in any of", re.IGNORECASE),
+    re.compile(r"directory prefix \. does not contain main module", re.IGNORECASE),
+    re.compile(r"go: no module file found", re.IGNORECASE),
+    re.compile(r"missing go\.sum entry", re.IGNORECASE),
+    re.compile(r"go: updates to go\.sum needed", re.IGNORECASE),
 ]
 
 # File + line extractors (various compiler output formats)
@@ -279,9 +308,34 @@ class FailureTracker:
 # Maps failure_type → short instruction injected into the LLM prompt
 RETRY_GUIDANCE: dict[str, str] = {
     SYNTAX_ERROR: (
-        "The last change caused a syntax error. Re-read the file you just edited, "
-        "find the exact broken line, and make a small targeted fix. Do NOT rewrite "
-        "the whole file."
+        "Compilation or syntax error detected. Re-read the file near the error line "
+        "and make a small targeted fix. Do NOT rewrite the whole file. "
+        "For Go: '...' is not valid as a statement — replace with 'return nil' or "
+        "an empty function body. 'undefined: pkg.X' for a third-party library → the "
+        "API changed in the installed version. Find actual names with: "
+        "`grep -rn '^type \\|^func ' $(go env GOPATH)/pkg/mod/<author>/<pkg>*/*.go 2>/dev/null | grep -v '_test.go' | head -40` "
+        "(use glob * for version, e.g. github.com/asticode/go-astiav*). "
+        "Many libraries also ship examples — check them: "
+        "`ls $(go env GOPATH)/pkg/mod/<author>/<pkg>*/examples/ 2>/dev/null` "
+        "then `cat` the relevant example to see the exact API usage pattern. "
+        "Use `go doc <pkg>` or `go doc <pkg>.<Type>` to read method signatures. "
+        "Use ONLY names that exist in the installed version. "
+        "'undefined: X' (local) means X is out of scope or misspelled. "
+        "'imported and not used' → remove the unused import line. "
+        "'declared and not used: X' → remove variable X or use it. "
+        "'cannot use X as type Y' or 'cannot convert X to type Y' → check the type "
+        "definition in the source file and use the correct type or a proper conversion. "
+        "Common Go type fixes: 'byte' → 'rune' requires rune(b) cast; "
+        "'string' → '[]byte' requires []byte(s); 'int' → 'int64' requires int64(n). "
+        "If indexing a string with s[i], the result is a byte, not a rune — "
+        "use rune(s[i]) when a rune is needed. "
+        "'cannot use *T as T' → declare variable as *T or dereference with (*result). "
+        "'cannot use T as *T' → remove & or pass address. "
+        "Read the function signature in the source to know if it returns T or *T. "
+        "'invalid append: argument must be a slice; have result (variable of type *[]T)' → "
+        "you are appending to a pointer-to-slice. Dereference first: "
+        "`*result = append(*result, item)` or use a local slice variable. "
+        "'cannot range over X (variable of type *[]T)' → same issue: dereference with `*X` before ranging."
     ),
     TEST_FAILURE: (
         "A test is failing. Read the failing test and the code it exercises. "
@@ -298,7 +352,18 @@ RETRY_GUIDANCE: dict[str, str] = {
     ),
     MISSING_DEPENDENCY: (
         "A missing module/dependency was reported. Check that the import path is "
-        "correct and the module exists in the project. Do NOT install new packages."
+        "correct. For Go: if 'does not contain main module' → go.mod must be in the "
+        "CURRENT WORKING DIRECTORY (repo root). Move or create go.mod there with "
+        "'go mod init <name>'. Then place all source files relative to that root. "
+        "If 'no required module provides package X/Y/Z' → check if X is the module "
+        "name in go.mod. If X is a long path like 'github.com/user/repo' but go.mod "
+        "says 'module myrepo', your internal import is WRONG. Fix the import: replace "
+        "the prefix with the actual module name from go.mod "
+        "(e.g. import 'github.com/user/repo/internal/foo' → 'myrepo/internal/foo'). "
+        "Only run 'go get <pkg>' for THIRD-PARTY packages not defined locally. "
+        "If 'missing go.sum entry' → run 'go get ./...' then 'go mod tidy' from the "
+        "directory containing go.mod. This updates both go.mod and go.sum. "
+        "For Python/Node: only use packages already in requirements.txt/package.json."
     ),
     REVIEW_REJECTION: (
         "The reviewer found issues. Address each piece of feedback. Focus on what "
@@ -311,9 +376,37 @@ RETRY_GUIDANCE: dict[str, str] = {
 }
 
 
-def get_retry_guidance(failure_type: str) -> str:
-    """Return the retry instruction for a given failure type."""
-    return RETRY_GUIDANCE.get(failure_type, RETRY_GUIDANCE[UNKNOWN_FAILURE])
+def get_retry_guidance(failure_type: str, raw_output: str = "") -> str:
+    """Return the retry instruction for a given failure type.
+
+    If raw_output is provided, we extract specific recovery commands from it
+    (e.g. 'to add it: go get pkg') and prepend them to the generic guidance.
+    """
+    base = RETRY_GUIDANCE.get(failure_type, RETRY_GUIDANCE[UNKNOWN_FAILURE])
+
+    if not raw_output:
+        return base
+
+    # Extract 'go get <pkg>' commands suggested by the Go toolchain
+    go_get_cmds = list(dict.fromkeys(  # deduplicate, preserve order
+        m.group(0) for m in re.finditer(r"go get \S+", raw_output)
+    ))
+    # Extract 'go mod download <pkg>'
+    go_mod_cmds = list(dict.fromkeys(
+        m.group(0) for m in re.finditer(r"go mod download \S+", raw_output)
+    ))
+
+    specifics: list[str] = []
+    if go_get_cmds:
+        cmds = "  \n".join(go_get_cmds[:4])  # cap at 4 to avoid spam
+        specifics.append(f"Run these commands first (suggested by compiler):\n  {cmds}")
+    if go_mod_cmds:
+        cmds = "  \n".join(go_mod_cmds[:4])
+        specifics.append(f"Then run: {go_mod_cmds[0]}")
+
+    if specifics:
+        return "\n".join(specifics) + "\n" + base
+    return base
 
 
 # ---------------------------------------------------------------------------

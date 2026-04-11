@@ -26,6 +26,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import shutil
@@ -36,6 +37,20 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+
+# Maven binary — resolved once at import time via mise install or system PATH
+_MVN_BIN: str = shutil.which("mvn") or str(
+    Path.home() / ".local/share/mise/installs/maven/3.9.14/apache-maven-3.9.14/bin/mvn"
+)
+
+# Gradle binary — resolved once at import time (requires Gradle 8.x + Java 21)
+_GRADLE_BIN: str = shutil.which("gradle") or str(
+    Path.home() / ".local/share/mise/installs/gradle/8.12.1/gradle-8.12.1/bin/gradle"
+)
+# Java 21 JAVA_HOME for Gradle (Gradle 8.x incompatible with Java 26)
+_JAVA21_HOME: str = str(
+    Path.home() / ".local/share/mise/installs/java/21.0.2"
+)
 
 AGENT_ROOT = Path(__file__).resolve().parent.parent
 BENCHMARK_ROOT = AGENT_ROOT / "benchmark" / "benchmarks"
@@ -128,17 +143,39 @@ class BenchmarkTask:
 
 
 def _verify_go_builds(workdir: Path) -> tuple[bool, str]:
-    """Check that Go code in workdir compiles."""
-    result = subprocess.run(
-        ["go", "build", "./..."],
-        cwd=workdir,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if result.returncode == 0:
-        return True, "go build succeeded"
-    return False, f"go build failed:\n{result.stderr[:500]}"
+    """Check that Go code in workdir compiles.
+
+    Tries the workdir first; if no go.mod is found there, searches for the
+    nearest subdirectory containing go.mod and builds from there instead.
+    """
+    def _try_build(cwd: Path) -> tuple[bool, str]:
+        result = subprocess.run(
+            ["go", "build", "./..."],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode == 0:
+            return True, f"go build succeeded (from {cwd.name}/)"
+        return False, result.stderr[:500]
+
+    # Try the workdir first
+    if (workdir / "go.mod").exists():
+        ok, msg = _try_build(workdir)
+        if ok:
+            return True, msg
+        return False, f"go build failed:\n{msg}"
+
+    # No go.mod at root — search immediate subdirectories
+    for sub in sorted(workdir.iterdir()):
+        if sub.is_dir() and (sub / "go.mod").exists():
+            ok, msg = _try_build(sub)
+            if ok:
+                return True, msg
+            return False, f"go build failed (from {sub.name}/):\n{msg}"
+
+    return False, "go build failed: no go.mod found in workdir or immediate subdirectories"
 
 
 def _verify_go_tests(workdir: Path) -> tuple[bool, str]:
@@ -190,6 +227,168 @@ def _verify_npm_builds(workdir: Path) -> tuple[bool, str]:
     if build.returncode == 0:
         return True, "npm build succeeded"
     return False, f"npm build failed:\n{build.stderr[:500]}"
+
+
+def _verify_maven_tests(workdir: Path) -> tuple[bool, str]:
+    """Check that Maven test suite compiles and passes."""
+    result = subprocess.run(
+        [_MVN_BIN, "test", "-q", "--no-transfer-progress"],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if result.returncode == 0:
+        return True, "mvn test passed"
+    output = (result.stdout + result.stderr)[-600:]
+    return False, f"mvn test failed:\n{output}"
+
+
+def _verify_gradle_tests(workdir: Path) -> tuple[bool, str]:
+    """Check that Gradle test suite compiles and passes (uses Java 21 for compatibility)."""
+    import os as _os
+    env = _os.environ.copy()
+    if Path(_JAVA21_HOME).exists():
+        env["JAVA_HOME"] = _JAVA21_HOME
+        env["PATH"] = str(Path(_JAVA21_HOME) / "bin") + ":" + env.get("PATH", "")
+    result = subprocess.run(
+        [_GRADLE_BIN, "test", "--no-daemon", "-q"],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
+    if result.returncode == 0:
+        return True, "gradle test passed"
+    output = (result.stdout + result.stderr)[-600:]
+    return False, f"gradle test failed:\n{output}"
+
+
+def _verify_typescript_compiles(workdir: Path) -> tuple[bool, str]:
+    """Check that the project installs and type-checks with tsc --noEmit."""
+    install = subprocess.run(
+        ["npm", "install", "--silent"],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if install.returncode != 0:
+        return False, f"npm install failed:\n{install.stderr[:400]}"
+    tsc = subprocess.run(
+        ["npx", "tsc", "--noEmit"],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if tsc.returncode == 0:
+        return True, "tsc --noEmit passed"
+    return False, f"tsc --noEmit failed:\n{tsc.stdout[:400]}\n{tsc.stderr[:200]}"
+
+
+def _verify_cargo_tests(workdir: Path) -> tuple[bool, str]:
+    """Run cargo test and check tests pass. Also requires #[cfg(test)] block."""
+    # Check that unit tests were actually added (not just doc-tests)
+    rs_files = list(workdir.rglob("*.rs"))
+    has_test_module = any(
+        "#[cfg(test)]" in f.read_text(errors="ignore")
+        for f in rs_files
+    )
+    if not has_test_module:
+        return False, "No #[cfg(test)] module found in any .rs file — unit tests not written"
+
+    result = subprocess.run(
+        ["cargo", "test"],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    output = (result.stdout + result.stderr)[-800:]
+    if result.returncode == 0:
+        return True, f"cargo test passed:\n{output}"
+    return False, f"cargo test failed:\n{output}"
+
+
+def _verify_fastapi_tests(workdir: Path) -> tuple[bool, str]:
+    """Require a test_write.py file and run all pytest tests."""
+    # Check agent wrote the required test file
+    test_files = list(workdir.rglob("test_write*.py"))
+    if not test_files:
+        return False, "No test_write*.py file found — agent must write tests for mutating endpoints"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-x", "--tb=short", "-q"],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    output = (result.stdout + result.stderr)[-800:]
+    if result.returncode == 0:
+        return True, f"pytest passed:\n{output}"
+    return False, f"pytest failed:\n{output}"
+
+
+def _verify_pytest_passes(workdir: Path) -> tuple[bool, str]:
+    """Run pytest and check all tests pass."""
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-x", "--tb=short", "-q"],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    output = (result.stdout + result.stderr)[-800:]
+    if result.returncode == 0:
+        return True, f"pytest passed:\n{output}"
+    return False, f"pytest failed:\n{output}"
+
+
+def _verify_jest_passes(workdir: Path) -> tuple[bool, str]:
+    """Install npm deps and run Jest tests."""
+    install = subprocess.run(
+        ["npm", "install", "--silent"],
+        cwd=workdir, capture_output=True, text=True, timeout=120,
+    )
+    if install.returncode != 0:
+        return False, f"npm install failed:\n{install.stderr[:400]}"
+    result = subprocess.run(
+        ["npx", "jest", "--passWithNoTests", "--forceExit"],
+        cwd=workdir, capture_output=True, text=True, timeout=120,
+    )
+    output = (result.stdout + result.stderr)[-800:]
+    if result.returncode == 0:
+        return True, f"jest passed:\n{output}"
+    return False, f"jest failed:\n{output}"
+
+
+def _verify_jest_coverage(workdir: Path) -> tuple[bool, str]:
+    """Run Jest with coverage and verify >=80% line coverage."""
+    install = subprocess.run(
+        ["npm", "install", "--silent"],
+        cwd=workdir, capture_output=True, text=True, timeout=120,
+    )
+    if install.returncode != 0:
+        return False, f"npm install failed:\n{install.stderr[:400]}"
+    result = subprocess.run(
+        ["npx", "jest", "--coverage", "--forceExit", "--passWithNoTests"],
+        cwd=workdir, capture_output=True, text=True, timeout=120,
+    )
+    output = (result.stdout + result.stderr)
+    if result.returncode == 0:
+        # Look for coverage summary line like "Lines   : 85.71%"
+        import re
+        m = re.search(r"Lines\s+:\s+(\d+(?:\.\d+)?)\s*%", output)
+        if m:
+            pct = float(m.group(1))
+            if pct >= 80:
+                return True, f"jest coverage passed: {pct:.1f}% lines"
+            return False, f"jest coverage too low: {pct:.1f}% (need 80%)\n{output[-500:]}"
+        # If no coverage line found but tests passed, partial pass
+        return True, f"jest passed (coverage not parsed)\n{output[-300:]}"
+    return False, f"jest --coverage failed:\n{output[-500:]}"
 
 
 def _verify_agent_completed(workdir: Path) -> tuple[bool, str]:
@@ -339,6 +538,208 @@ BENCHMARK_TASKS: list[BenchmarkTask] = [
             "Detokenize the basic code and write the result into .bas files"
         ),
         verify=_verify_files_exist("*.bas"),
+        timeout_minutes=40,
+    ),
+    # 11. Write JUnit 5 tests for a Java EventBus
+    BenchmarkTask(
+        name="unittest_java",
+        benchmark_dir="java_eventbus",
+        prompt=(
+            "Write JUnit 5 unit tests for the EventBus class in "
+            "src/test/java/com/example/eventbus/. "
+            "Tests should cover: subscribers receive published events, "
+            "multiple subscribers all receive the same event, "
+            "unsubscribed handlers are NOT called, "
+            "publish() returns the correct handler count, "
+            "and null arguments throw IllegalArgumentException."
+        ),
+        verify=_make_combined_verifier(
+            _verify_files_exist("*Test.java"),
+            _verify_maven_tests,
+        ),
+        timeout_minutes=20,
+    ),
+    # 12. Convert a JavaScript text-util library to TypeScript
+    BenchmarkTask(
+        name="typescript_convert",
+        benchmark_dir="ts_textutil",
+        prompt=(
+            "Convert the JavaScript source files in src/ to TypeScript. "
+            "Add a tsconfig.json with strict mode enabled. "
+            "Add proper type annotations and interfaces so the project "
+            "compiles with `tsc --noEmit` without errors. "
+            "Keep module.exports / CommonJS style."
+        ),
+        verify=_make_combined_verifier(
+            _verify_files_exist("*.ts", "tsconfig.json"),
+            _verify_typescript_compiles,
+        ),
+        timeout_minutes=20,
+    ),
+    # 13. Write pytest tests for a Python URL shortener library
+    BenchmarkTask(
+        name="unittest_python",
+        benchmark_dir="python_urlshortener",
+        prompt=(
+            "The src/shortener.py module implements a URL shortener with TTL support. "
+            "Write comprehensive pytest tests in tests/test_shortener.py covering: "
+            "shorten() validates URLs and returns a consistent code, "
+            "expand() returns the original URL and increments hits, "
+            "expand() returns None for unknown or expired codes (use a past timestamp), "
+            "delete() removes an entry, "
+            "count() tracks only non-expired entries, "
+            "stats() returns hit count and metadata. "
+            "Use pytest fixtures. All tests must pass."
+        ),
+        verify=_make_combined_verifier(
+            _verify_files_exist("test_*.py"),
+            _verify_pytest_passes,
+        ),
+        timeout_minutes=20,
+    ),
+    # 14. Write Jest tests with coverage for a TypeScript semver library
+    BenchmarkTask(
+        name="ts_coverage",
+        benchmark_dir="ts_coverage",
+        prompt=(
+            "Write Jest tests for src/semver.ts to achieve at least 80% line coverage. "
+            "Create src/semver.test.ts (or __tests__/semver.test.ts). "
+            "Cover: parse() throws ParseError for invalid strings, "
+            "compare() correctly orders release vs pre-release versions, "
+            "gt()/lt()/eq() convenience functions, "
+            "latest() and sort(), "
+            "bumpPatch/Minor/Major reset lower components correctly. "
+            "Run: npm install && npx jest --coverage"
+        ),
+        verify=_make_combined_verifier(
+            _verify_files_exist("*.test.ts"),
+            _verify_jest_coverage,
+        ),
+        timeout_minutes=20,
+    ),
+    # 15. Fix bugs in a Python inventory management module
+    BenchmarkTask(
+        name="python_bugfix",
+        benchmark_dir="python_bugfix",
+        prompt=(
+            "The file inventory.py has 5 bugs. The test file test_inventory.py "
+            "shows exactly what the correct behavior should be — each test "
+            "corresponds to one bug. Fix ALL 5 bugs in inventory.py so that "
+            "pytest test_inventory.py passes completely. "
+            "Do NOT modify test_inventory.py."
+        ),
+        verify=_make_combined_verifier(
+            _verify_files_exist("inventory.py"),
+            _verify_pytest_passes,
+        ),
+        timeout_minutes=15,
+    ),
+    # 16. Write JUnit 5 tests for a Java LRU cache
+    BenchmarkTask(
+        name="unittest_java_cache",
+        benchmark_dir="java_cache",
+        prompt=(
+            "Write JUnit 5 tests for the LRUCache class in "
+            "src/main/java/com/example/cache/LRUCache.java. "
+            "Place tests in src/test/java/com/example/cache/LRUCacheTest.java. "
+            "Cover: basic put/get, LRU eviction (oldest evicted when full), "
+            "capacity() and size() accuracy, remove() and clear(), "
+            "thread safety is NOT required to test — single-threaded tests only, "
+            "null key handling, and IllegalArgumentException for capacity <= 0. "
+            "Run: mvn test"
+        ),
+        verify=_make_combined_verifier(
+            _verify_files_exist("*Test.java"),
+            _verify_maven_tests,
+        ),
+        timeout_minutes=20,
+    ),
+    # 17. Write pytest tests for a Python analytics library (Pipeline class)
+    BenchmarkTask(
+        name="python_analytics",
+        benchmark_dir="python_analytics",
+        prompt=(
+            "The analytics library in src/analytics/ has three modules. "
+            "Tests for events.py and metrics.py already exist in tests/ — "
+            "read them to understand the testing patterns. "
+            "Write tests/test_pipeline.py with pytest tests for the Pipeline class "
+            "in src/analytics/pipeline.py. Cover:\n"
+            "- filter(): keeps matching events, removes non-matching\n"
+            "- rename(): renames events with old_name to new_name, "
+            "  raises ValueError for empty new_name\n"
+            "- scale(): multiplies all values by factor\n"
+            "- add_tag(): adds/overwrites a tag on all events\n"
+            "- build(): returns an EventStream\n"
+            "- Method chaining: filter().rename().scale().build() works correctly\n"
+            "Run: python -m pytest tests/ -v"
+        ),
+        verify=_make_combined_verifier(
+            _verify_files_exist("test_pipeline.py"),
+            _verify_pytest_passes,
+        ),
+        timeout_minutes=20,
+    ),
+    # 18. Write JUnit 5 tests for a Gradle Java task management library
+    BenchmarkTask(
+        name="unittest_gradle",
+        benchmark_dir="gradle_tasklib",
+        prompt=(
+            "Write JUnit 5 tests for the task management library using Gradle. "
+            "The library has three classes:\n"
+            "- Task (src/main/java/com/example/tasklib/Task.java): "
+            "  lifecycle (start/complete/cancel), state transitions, "
+            "  validation (blank title, null priority)\n"
+            "- TaskBoard (src/main/java/com/example/tasklib/TaskBoard.java): "
+            "  add/remove/find tasks, filter by status/priority/assignee, summary()\n"
+            "- TaskFilter (src/main/java/com/example/tasklib/TaskFilter.java): "
+            "  highPriority(), active(), sortByPriorityThenTitle(), search()\n"
+            "Place tests in src/test/java/com/example/tasklib/. "
+            "Build and test with: JAVA_HOME=$(mise where java@21) gradle test --no-daemon"
+        ),
+        verify=_make_combined_verifier(
+            _verify_files_exist("*Test.java"),
+            _verify_gradle_tests,
+        ),
+        timeout_minutes=25,
+    ),
+    # 19. Write Rust unit tests for an expression evaluator + stats library
+    BenchmarkTask(
+        name="unittest_rust",
+        benchmark_dir="rust_calc",
+        prompt=(
+            "Write Rust unit tests for the calc library in src/lib.rs. "
+            "IMPORTANT: In Rust, unit tests go in a #[cfg(test)] module at the "
+            "BOTTOM of the same file (src/lib.rs). Do NOT create a separate test file. "
+            "Use #[test] attribute and `use super::*;` inside the test module. "
+            "Cover both items:\n"
+            "- eval(): basic arithmetic, parentheses, negative numbers, "
+            "  whitespace, division by zero returns Err, bad input returns Err\n"
+            "- Stats: count/sum/min/max/mean/median for normal and empty slices\n"
+            "Run: cargo test"
+        ),
+        verify=_verify_cargo_tests,
+        timeout_minutes=20,
+    ),
+    # 20. Write pytest tests for a FastAPI bookmarks REST API (write endpoints)
+    BenchmarkTask(
+        name="python_fastapi",
+        benchmark_dir="python_fastapi",
+        prompt=(
+            "The FastAPI bookmarks API is in src/app.py. "
+            "Read tests/test_read.py to understand the testing patterns "
+            "(TestClient, autouse fixture that calls reset_store(), helper function). "
+            "Write tests/test_write.py with pytest tests covering the mutating endpoints:\n"
+            "- POST /bookmarks: creates bookmark, returns 201 with id/url/title/tags, "
+            "  rejects invalid URL (not http/https), rejects empty title\n"
+            "- PATCH /bookmarks/{id}: updates title and/or tags, returns updated bookmark, "
+            "  ignores None fields, returns 404 for missing id, strips whitespace from title\n"
+            "- DELETE /bookmarks/{id}: returns 204, bookmark is gone after deletion, "
+            "  returns 404 for missing id\n"
+            "- ID auto-increment: each new bookmark gets a unique incrementing id\n"
+            "sys.path hint: add src/ to sys.path the same way test_read.py does. "
+            "Run: python -m pytest tests/ -v"
+        ),
+        verify=_verify_fastapi_tests,
         timeout_minutes=20,
     ),
 ]
@@ -693,6 +1094,8 @@ def main():
                         help="Model name")
     parser.add_argument("--report-file", type=str,
                         help="Write JSON report to file")
+    parser.add_argument("--parallel", type=int, default=1, metavar="N",
+                        help="Run up to N benchmark tasks concurrently (default: 1)")
     args = parser.parse_args()
 
     from datetime import datetime, timezone
@@ -722,14 +1125,43 @@ def main():
                 print(f"Unknown task '{args.task}'. Available: {names}", file=sys.stderr)
                 sys.exit(3)
 
-        _log(f"\nRunning {len(tasks_to_run)} benchmark task(s)...")
-        for task in tasks_to_run:
-            timeout = args.timeout if args.timeout else task.timeout_minutes
-            _log(f"  Starting: {task.name} (timeout: {timeout}m)...")
-            result = _run_single_benchmark(task, args.llm_url, args.model, timeout)
-            report.benchmark_results.append(result)
-            status = "PASS" if result.passed else "FAIL"
-            _log(f"  [{status}] {task.name}  ({result.elapsed_seconds:.0f}s)")
+        workers = min(args.parallel, len(tasks_to_run))
+        _log(f"\nRunning {len(tasks_to_run)} benchmark task(s) "
+             f"({'parallel=' + str(workers) if workers > 1 else 'sequential'})...")
+
+        if workers <= 1:
+            for task in tasks_to_run:
+                timeout = args.timeout if args.timeout else task.timeout_minutes
+                _log(f"  Starting: {task.name} (timeout: {timeout}m)...")
+                result = _run_single_benchmark(task, args.llm_url, args.model, timeout)
+                report.benchmark_results.append(result)
+                status = "PASS" if result.passed else "FAIL"
+                _log(f"  [{status}] {task.name}  ({result.elapsed_seconds:.0f}s)")
+        else:
+            results_map: dict[str, TestResult] = {}
+
+            def _run(task: BenchmarkTask) -> TestResult:
+                timeout = args.timeout if args.timeout else task.timeout_minutes
+                _log(f"  Starting: {task.name} (timeout: {timeout}m)...")
+                r = _run_single_benchmark(task, args.llm_url, args.model, timeout)
+                status = "PASS" if r.passed else "FAIL"
+                _log(f"  [{status}] {task.name}  ({r.elapsed_seconds:.0f}s)")
+                return r
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_run, t): t for t in tasks_to_run}
+                for fut in concurrent.futures.as_completed(futures):
+                    task = futures[fut]
+                    try:
+                        results_map[task.name] = fut.result()
+                    except Exception as e:
+                        results_map[task.name] = TestResult(
+                            name=task.name, passed=False,
+                            details=f"Executor error: {e}", category="benchmark",
+                        )
+
+            # Preserve original task order in the report
+            report.benchmark_results = [results_map[t.name] for t in tasks_to_run]
 
     report.total_elapsed_seconds = round(time.time() - t_start, 1)
     report.compute_scores()

@@ -57,8 +57,8 @@ class LLMManager:
         self.num_predict = config.num_predict
 
         # Retry settings for transient failures
-        self.max_retries = getattr(config, "max_retries", 3)
-        self.retry_base_delay = 2  # seconds — doubles each retry (2, 4, 8)
+        self.max_retries = getattr(config, "max_retries", 5)
+        self.retry_base_delay = 2  # seconds — jittered exponential (2, 4, 8, 16, 32…)
 
         # Setup dedicated LLM logger
         self.llm_logger = logging.getLogger("coding-agent.llm")
@@ -153,11 +153,20 @@ class LLMManager:
         Retries on connection errors and timeouts but NOT on 4xx responses
         (those indicate a real problem with the request).
         """
+        import random as _random
         import requests as _req
         import time
 
         logger = logging.getLogger("coding-agent")
         last_err = None
+
+        def _jittered_delay(attempt: int) -> float:
+            """Exponential backoff with ±50% jitter to decorrelate parallel retries."""
+            base = min(self.retry_base_delay * (2 ** (attempt - 1)), 60)
+            # Seed from nanosecond time XOR attempt counter so parallel agents diverge
+            seed = (time.time_ns() ^ (attempt * 0x9E3779B9)) & 0xFFFFFFFF
+            rng = _random.Random(seed)
+            return base + rng.uniform(0, 0.5 * base)
 
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -165,10 +174,10 @@ class LLMManager:
 
                 # Retry on 5xx server errors (LM Studio/Ollama overloaded)
                 if resp.status_code >= 500 and attempt < self.max_retries:
-                    delay = self.retry_base_delay * (2 ** (attempt - 1))
+                    delay = _jittered_delay(attempt)
                     logger.warning(
                         "LLM server returned %d (attempt %d/%d). "
-                        "Retrying in %ds...",
+                        "Retrying in %.1fs...",
                         resp.status_code, attempt, self.max_retries, delay,
                     )
                     time.sleep(delay)
@@ -181,7 +190,7 @@ class LLMManager:
                 err_type = type(e).__name__
 
                 if attempt < self.max_retries:
-                    delay = self.retry_base_delay * (2 ** (attempt - 1))
+                    delay = _jittered_delay(attempt)
                     logger.warning(
                         "LLM request failed: %s (%s) — attempt %d/%d. "
                         "Retrying in %ds...",
