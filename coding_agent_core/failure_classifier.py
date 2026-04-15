@@ -73,20 +73,26 @@ _SYNTAX_PATTERNS: list[re.Pattern] = [
     re.compile(r"argument must be a slice", re.IGNORECASE),     # Go: append wrong type
     re.compile(r"cannot assign to .+\(.*not addressable\)", re.IGNORECASE),  # Go: non-addressable
     re.compile(r"must be a slice type", re.IGNORECASE),         # Go: range/append on pointer
+    re.compile(
+        r"cannot use .+ as int value in array or slice literal",
+        re.IGNORECASE,
+    ),  # Go: byte/uint8 in []int{} — need int(x)
+    re.compile(r"mismatched types error and untyped int", re.IGNORECASE),  # Go: err == 0 mistake
+    re.compile(r"no new variables on left side of :=", re.IGNORECASE),  # Go: use = not :=
 ]
 
 _TEST_PATTERNS: list[re.Pattern] = [
     re.compile(r"FAIL\s+(src/|tests/|test/)", re.IGNORECASE),
     re.compile(r"FAILED\s+tests?/", re.IGNORECASE),
+    re.compile(r"\[setup failed\]", re.IGNORECASE),   # Go: TestMain/init panic
     re.compile(r"AssertionError:", re.IGNORECASE),
     re.compile(r"AssertionError", re.IGNORECASE),  # catch misspellings in output
-    re.compile(r"AssertionError", re.IGNORECASE),
     re.compile(r"assert .+ (==|!=|is|in) ", re.IGNORECASE),
     re.compile(r"Test Suites:.*failed", re.IGNORECASE),
     re.compile(r"Tests:\s+\d+ failed", re.IGNORECASE),
     re.compile(r"FAILURES", re.IGNORECASE),
     re.compile(r"pytest.*FAILED", re.IGNORECASE),
-    re.compile(r"AssertionError", re.IGNORECASE),
+    re.compile(r"RecursionError:", re.IGNORECASE),  # e.g. monkeypatch calling patched func
 ]
 
 _LINT_PATTERNS: list[re.Pattern] = [
@@ -125,6 +131,7 @@ _DEPENDENCY_PATTERNS: list[re.Pattern] = [
     re.compile(r"go: no module file found", re.IGNORECASE),
     re.compile(r"missing go\.sum entry", re.IGNORECASE),
     re.compile(r"go: updates to go\.sum needed", re.IGNORECASE),
+    re.compile(r"is not in std\b", re.IGNORECASE),   # Go: import treated as stdlib
 ]
 
 # File + line extractors (various compiler output formats)
@@ -314,14 +321,18 @@ RETRY_GUIDANCE: dict[str, str] = {
         "an empty function body. 'undefined: pkg.X' for a third-party library → the "
         "API changed in the installed version. Find actual names with: "
         "`grep -rn '^type \\|^func ' $(go env GOPATH)/pkg/mod/<author>/<pkg>*/*.go 2>/dev/null | grep -v '_test.go' | head -40` "
-        "(use glob * for version, e.g. github.com/asticode/go-astiav*). "
+        "(use glob * for version, e.g. github.com/someauthor/some-pkg*). "
         "Many libraries also ship examples — check them: "
         "`ls $(go env GOPATH)/pkg/mod/<author>/<pkg>*/examples/ 2>/dev/null` "
         "then `cat` the relevant example to see the exact API usage pattern. "
         "Use `go doc <pkg>` or `go doc <pkg>.<Type>` to read method signatures. "
         "Use ONLY names that exist in the installed version. "
         "'undefined: X' (local) means X is out of scope or misspelled. "
-        "'imported and not used' → remove the unused import line. "
+        "'more than one character in rune literal' → you used a multi-char string "
+        "where a single rune was expected. In Go, single quotes (') are for SINGLE "
+        "characters only (runes). Use double quotes (\") for strings, or index a string "
+        "to get a single byte. Example: '\\n' is valid (one char), '\\r\\n' is NOT (two chars). "
+        "'imported and not used' → remove the unused import line (applies to `*_test.go` too). "
         "'declared and not used: X' → remove variable X or use it. "
         "'cannot use X as type Y' or 'cannot convert X to type Y' → check the type "
         "definition in the source file and use the correct type or a proper conversion. "
@@ -335,12 +346,72 @@ RETRY_GUIDANCE: dict[str, str] = {
         "'invalid append: argument must be a slice; have result (variable of type *[]T)' → "
         "you are appending to a pointer-to-slice. Dereference first: "
         "`*result = append(*result, item)` or use a local slice variable. "
-        "'cannot range over X (variable of type *[]T)' → same issue: dereference with `*X` before ranging."
+        "'cannot range over X (variable of type *[]T)' → same issue: dereference with `*X` before ranging. "
+        "Go SCOPE ERRORS — 'undefined: err' or 'undefined: result' after an if/for block: "
+        "In Go, ':=' creates a variable scoped to the current block. "
+        "Example problem: `if result, err := foo(); err != nil { ... }` — both result "
+        "and err only exist inside that if-block. Outside the block: undefined. "
+        "Fix options: (a) declare before: `var err error; var result T; result, err = foo()` "
+        "then check `if err != nil { ... }` outside; or (b) keep everything inside one block. "
+        "Similarly, `for _, v := range xs { ... }` — v is only scoped to the for body. "
+        "BYTE VS INT IN SLICE LITERALS — 'cannot use X (variable of type byte) as int' in "
+        "`[]int{...}`: struct fields like `Opcode` are often `byte`/`uint8`. Either cast "
+        "`int(op.Opcode)` or change the slice to `[]byte{...}` if you meant raw bytes. "
+        "THIRD-PARTY API NAMES — 'has no field or method GetFoo' on a CGO/wrapper type: "
+        "Go conventions use `Foo()` not `GetFoo()`. Run `go doc <pkg>.<Type>` on the "
+        "INSTALLED module and use only methods shown there — do not copy method names from "
+        "a deprecated library the code used before. "
+        "`grep -n 'func (.*YourType' $(go env GOPATH)/pkg/mod/<author>/<pkg>@*/*.go` "
+        "lists real methods on that type. "
+        "'not enough arguments in call to X' → read `go doc X` for the full signature. "
+        "'mismatched types error and untyped int' → you compared `error` with `0`. Use "
+        "`if err != nil` / `errors.Is`, never `err == 0`. "
+        "'no new variables on left side of :=' → `:=` requires at least one NEW name. "
+        "If all names already exist, use `=` assignment instead. "
+        "'undefined: pkg.SomeEOF' (or similar sentinel) → the name may be in `io`, "
+        "`errors`, or the vendor package — grep the module for `EOF` / `Err` exports. "
+        "For `undefined:` in the **Go standard library**: run `go doc <import/path>` — "
+        "function names are exact; do not assume patterns from other languages (e.g. "
+        "fictional `New*` helpers)."
     ),
     TEST_FAILURE: (
-        "A test is failing. Read the failing test and the code it exercises. "
-        "Make a focused fix to the production code (or the test setup if the test "
-        "expectation is wrong). Re-run that specific test before moving on."
+        "A test is failing. Read the FUNCTION UNDER TEST (not just the test) to "
+        "understand what it actually does. If 'expected X, got Y': the source code "
+        "is the ground truth — re-read the function to understand WHY it returns Y, "
+        "then fix your assertion. Do NOT blindly swap expected/actual values without "
+        "understanding the behavior (other assertions may have the same wrong assumption). "
+        "If 'cannot find symbol' or 'undefined': you called a method that doesn't exist "
+        "on the class — re-read the class definition to find the actual method names. "
+        "Re-run that specific test before moving on. "
+        "If Go tests report '[setup failed]': run 'go test -v ./...' to see the "
+        "panic or initialization error. The most common cause is MISSING TESTDATA FILES — "
+        "tests that open files from a testdata/ directory will setup-fail if those files "
+        "don't exist. Fix: create the testdata/ directory alongside the test file and "
+        "write the required fixture files into it. Look at the test code to see which files "
+        "it opens (e.g. os.Open, ioutil.ReadFile) and create those files with realistic "
+        "content based on any example files already in the repo. "
+        "Also verify the test file is in the SAME directory as the source "
+        "(not in a separate tests/ dir). "
+        "If 'TypeError: X object is not subscriptable' → the result is an iterable object, "
+        "not a list/array. Re-read the source class to check its access methods. "
+        "DO NOT use result[0]. Instead: use list(result)[0], or next(iter(result)), "
+        "or the class's own accessor (e.g. result.values()[0], result.items()). "
+        "Check if the class defines __getitem__ before writing subscript assertions. "
+        "If 'AttributeError: X object has no attribute Y' → re-read the class definition "
+        "to find the actual attribute/method names (they may differ from what you assumed). "
+        "If 'TypeError: pytest.approx() only supports ordered sequences' → you passed a "
+        "set or dict to pytest.approx. Use sorted() on both sides, or compare with == directly. "
+        "If an assertion hardcodes a timestamp/UUID that changes every run (time.time(), "
+        "uuid4(), etc.), replace the hardcoded value with isinstance() or range checks. "
+        "If 'RecursionError: maximum recursion depth exceeded' in a monkeypatch/mock: "
+        "the patch lambda is calling the function it replaced. Save the REAL function "
+        "object first, then call that from the lambda: "
+        "`_real_time = time.time; monkeypatch.setattr(time, 'time', lambda: _real_time() + 3600)`. "
+        "Alternatively freeze once: `frozen = time.time(); monkeypatch.setattr(time, 'time', lambda: frozen)`. "
+        "Never write `time.time()` inside the replacement — that resolves to the patched "
+        "function and recurses. "
+        "If Java/Gradle output says 'required: <Type>, found: no arguments' for `new Foo()`: "
+        "open `Foo.java`, find the constructor signatures, and pass arguments that match."
     ),
     LINT_FAILURE: (
         "Lint errors were reported. Fix ONLY the specific issues listed in the "
@@ -363,6 +434,13 @@ RETRY_GUIDANCE: dict[str, str] = {
         "Only run 'go get <pkg>' for THIRD-PARTY packages not defined locally. "
         "If 'missing go.sum entry' → run 'go get ./...' then 'go mod tidy' from the "
         "directory containing go.mod. This updates both go.mod and go.sum. "
+        "If 'package X is not in std' → Go is looking for X as a standard-library "
+        "package, which means go.mod is MISSING or has the WRONG module name. "
+        "CRITICAL module path rule: the module name in go.mod is the IMPORT PREFIX, not "
+        "a directory. If go.mod says 'module myapp' at the repo root, then a package "
+        "at 'internal/foo/' is imported as 'myapp/internal/foo' (NOT as a bare path). "
+        "Run: cat go.mod to verify the module name, then run "
+        "'go build ./...' from the same directory as go.mod. "
         "For Python/Node: only use packages already in requirements.txt/package.json."
     ),
     REVIEW_REJECTION: (

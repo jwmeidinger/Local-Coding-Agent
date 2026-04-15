@@ -1071,11 +1071,10 @@ Begin working. Call your first tool now. Do NOT re-read files shown above."""
                 task_lower = context.task_description.lower()
                 if any(w in task_lower for w in ("port", "migrate", "convert")):
                     read_limit_specific = (
-                        "For this PORT task: write ONLY go.mod and main.go RIGHT NOW. "
-                        "main.go content: `package main\\nfunc main() {}` "
-                        "— NO imports, NO other packages, NO helper files. "
-                        "A zero-import empty main() that compiles IS a passing submission. "
-                        "Call done() as soon as `go build ./...` succeeds."
+                        "For this PORT/MIGRATE task: write the scaffold first. "
+                        "Create go.mod + main.go with `package main\\nfunc main() {}` "
+                        "right now — get a compilable skeleton before porting logic. "
+                        "Run `go build ./...` to verify it compiles, then add functionality."
                     )
                 else:
                     read_limit_specific = (
@@ -1129,6 +1128,13 @@ Begin working. Call your first tool now. Do NOT re-read files shown above."""
                         f"Priority: (1) complete any unfinished files, "
                         f"(2) run build/tests to verify, (3) call done()."
                     )})
+            elif step == int(max_steps * 0.75):
+                remaining = max_steps - step
+                messages.append({"role": "user", "content": (
+                    f"FINAL STRETCH ({step}/{max_steps} steps, {remaining} left): "
+                    f"complete in-flight work, run one verification command if needed, "
+                    f"then call done(). Avoid starting large new features."
+                )})
 
             # --- Nudge if too many edits without running tests ---
             # Only fires after at least one failed test run (agent is in fix loop)
@@ -1141,11 +1147,39 @@ Begin working. Call your first tool now. Do NOT re-read files shown above."""
                 )
                 messages.append({"role": "user", "content": nudge})
 
-            # --- Manage context window: summarize old tool results ---
-            self._trim_messages(messages)
-
-            # --- Call the LLM ---
-            response = self.llm.chat_with_tools(messages, tool_schemas)
+            # --- Manage context window + LLM (retry if server rejects prompt size) ---
+            response = ChatResponse()
+            for ctx_attempt in range(5):
+                self._trim_messages(messages)
+                response = self.llm.chat_with_tools(messages, tool_schemas)
+                if not getattr(response, "context_window_error", False):
+                    break
+                self.logger.warning(
+                    "Context window exceeded from LLM (%d/5) — emergency trim",
+                    ctx_attempt + 1,
+                )
+                self._emergency_trim_messages(messages)
+                if ctx_attempt == 0:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "The model rejected the previous request because the "
+                            "conversation exceeded its context limit. Older tool output "
+                            "was aggressively trimmed. Continue with your next tool call."
+                        ),
+                    })
+            if getattr(response, "context_window_error", False):
+                self.logger.error(
+                    "Context window still exceeded after emergency trims — aborting step",
+                )
+                error_count += 1
+                if error_count >= max_consecutive_errors:
+                    return False
+                messages.append({
+                    "role": "user",
+                    "content": "Context still too large after trimming. Call done() or a minimal tool.",
+                })
+                continue
 
             # Handle empty response (timeout / error)
             if response.is_empty:
@@ -2112,6 +2146,12 @@ Begin working. Call your first tool now. Do NOT re-read files shown above."""
         # --- Drop pass: if still over limit, drop oldest non-system messages ---
         while _total() > max_chars and len(messages) > 8:
             messages.pop(2)
+
+    def _emergency_trim_messages(self, messages: list) -> None:
+        """Aggressively shrink history after a context-window HTTP error from the LLM."""
+        mc = getattr(self.config, "max_prompt_chars", 80000)
+        self._trim_messages(messages, max_chars=int(mc * 0.42))
+        self._trim_messages(messages, max_chars=int(mc * 0.36))
 
     # Patterns that indicate the build TOOL is broken, not the code
     _BUILD_TOOL_BROKEN_PATTERNS = [

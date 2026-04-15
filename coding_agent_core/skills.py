@@ -97,6 +97,9 @@ KEY PRINCIPLES:
   name becomes the module prefix. To import a local sub-package `asm/`, use `<name>/asm`
   in import statements, NOT `github.com/user/asm`. Example: `go mod init myasm` then
   `import "myasm/asm"`. Run `grep module go.mod` to verify the module name if unsure.
+  Numeric composites: `[]int{...}` requires every element to be `int`. Fields that are
+  `byte`/`uint8` (e.g. opcodes) must be converted: `int(x)` — otherwise you get
+  'cannot use ... (type byte) as int'.
   CRITICAL — avoid package conflicts: All .go files in the same directory must declare the
   SAME package name. If any EXISTING .go file in the current directory has `package X`
   (where X is NOT main), you CANNOT add main.go there. Instead create a `cmd/<name>/`
@@ -106,24 +109,34 @@ KEY PRINCIPLES:
   `package main`, not main.go in the root (that would cause "found packages asm and main").
   CRITICAL — go.mod location: ALWAYS create go.mod in the CURRENT WORKING DIRECTORY
   (the repo root) unless the task EXPLICITLY says to work in a subdirectory. When you
-  are at the repo root (e.g. `/tmp/bench_foo/repo`), create `go.mod` there. Then
-  run `go build ./...` from that same root. Do NOT create unnecessary subdirectories.
-  Exception: if the project already has an existing subdirectory with its own go.mod
-  (e.g. you are porting code that lives in `decomp/`), then run go build from that subdir.
+  are at the repo root, create `go.mod` there. Then run `go build ./...` from that same
+  root. Do NOT create unnecessary subdirectories.
+  Exception: if the project already has an existing subdirectory with its own go.mod,
+  run go build from that subdir instead.
 - When converting JavaScript to TypeScript: create NEW files with .ts extension
   (e.g. app.ts, utils.ts). Do NOT just add type comments to .js files. Also create
-  a tsconfig.json if one doesn't exist.
-- When migrating from one Go library to another (e.g. old FFmpeg binding → go-astiav):
-  DISCOVER the new API FIRST before writing any code. Strategy:
-  1. Run `go get <new-lib>` to ensure it's downloaded.
-  2. Run `go doc <new-lib>` to list all exported types and functions.
-  3. Run `grep -rn '^type \|^func ' $(go env GOPATH)/pkg/mod/<author>/<pkg>*/*.go 2>/dev/null | grep -v _test | head -60`
+  a tsconfig.json if one doesn't exist. Run `npm install` (bare) if package.json exists
+  but node_modules is missing before `npm run build` or tests.
+- When the task mentions a front-end build tool (Vite, webpack, esbuild, etc.): in your
+  FIRST writes, create `package.json` (with the build tool + scripts) and its config
+  file (e.g. vite.config.ts), then add source files. Do not spend many steps reading
+  before those config files exist.
+- For multi-step tasks on the same repo (e.g. refactor → add build tool → migrate types):
+  each sub-task may need NEW artifacts — always check whether config files already exist
+  before creating them, and create missing ones before declaring done().
+- When migrating from one library to another: DISCOVER the new library's API FIRST before
+  writing any code. Strategy:
+  1. Run `go get <new-lib>` (Go) or check package docs to ensure it's available.
+  2. Run `go doc <new-lib>` or read installed source to list exported types and functions.
+  3. Run `grep -rn '^type \\|^func ' $(go env GOPATH)/pkg/mod/<author>/<pkg>*/*.go 2>/dev/null | grep -v _test | head -60`
      to see the actual API of the installed version (use * glob for version).
-  4. Check examples if available: `ls $(go env GOPATH)/pkg/mod/<author>/<pkg>*/examples/ 2>/dev/null`
+  4. Check examples if available in the package's examples/ directory.
   5. ONLY THEN write the migrated code, using only names that appear in the doc output.
-  Do NOT guess API names from the old library — the new library will have different names.
-  Common mistake: if old code uses `pkg.Decoder`, the new library may use `pkg.CodecContext`.
-  Always verify with `go doc` before writing.
+  Do NOT guess API names from the old library — APIs change between libraries.
+  Always verify the new library's type/function names with `go doc` before writing.
+  Wrapper libraries (FFmpeg, etc.): getters are usually `Foo()` in Go, not `GetFoo()`.
+  If a method is missing, you are reading the wrong library's mental model — re-read
+  `go doc <pkg>.<Type>` for the version in go.sum.
 - When porting code from one language to another (Python→Go, etc.): prioritize getting
   a MINIMAL COMPILABLE SKELETON first. Don't try to port all files at once. Strategy:
   1. Create go.mod in the CURRENT WORKING DIRECTORY: `go mod init <name>` or file_write
@@ -131,6 +144,15 @@ KEY PRINCIPLES:
   3. Run `go build ./...` from repo root — a skeleton that compiles beats nothing.
   4. Only add more files after the skeleton compiles.
   Do NOT read all source files before writing. Write the skeleton FIRST.
+-   Multi-file Go in ONE module: every symbol a file references must exist in the same
+  module (defined in that file or another file in the package, or imported). If `go build`
+  reports `undefined: SomeType` or `undefined: NewParser`, you added code that references
+  types not yet defined — add the defining files first, or stubs for all types in one pass,
+  then run `go build ./...` before writing dependent logic. Same for unused imports across
+  packages: remove them or use the import; `undefined: Expr` often means wrong package
+  qualifier or missing type definition in that directory.
+  If the compiler says `no new variables on left side of :=`, switch that line to `=` —
+  you reused `:=` where all variables were already declared.
 - When the task says "write the result into <ext> files" or "save output as <ext>":
   This means you must EXECUTE a transformation and produce the output files.
   Strategy: 1. Write a script to do the transformation. 2. Run it with bash_exec.
@@ -145,17 +167,19 @@ Create a SHORT action plan (max 15 lines). Reference ONLY files from the tree ab
 3. What existing files to modify (exact paths)
 4. What build/test command to verify the result
 
-IMPORTANT — if this is a PORT task (Python→Go, etc.):
-- Your MINIMUM GOAL: create EXACTLY 2 files: go.mod + main.go. That's it.
-- go.mod content: `module <name>\ngo 1.21` (if go.mod already exists, skip it)
-- main.go content: `package main\nfunc main() {}` (no imports needed!)
-- The skeleton main.go MUST have zero import statements. Empty main() is enough.
-- DO NOT write internal packages, helper files, or ANY other .go files.
-- DO NOT import non-standard packages — a build that needs `go get` will fail.
-- Plan: (optionally read 1 design doc) → file_write go.mod → file_write main.go
-  → bash go build ./... → done() if it compiles.
-- A 2-file skeleton that compiles is a PASSING submission.
-- Execute: file_write go.mod, file_write main.go, bash go build ./..., done().""",
+IMPORTANT — if this is a PORT task (Python→Go, C→Rust, etc.), use an INCREMENTAL strategy:
+- Phase 1 (skeleton): create go.mod + a main.go with `package main\nfunc main() {{}}`.
+  Verify it compiles before adding any imports or packages. An empty skeleton that
+  compiles is a solid foundation — build on it rather than writing everything at once.
+- Phase 2 (core logic): port the primary entry point and its direct dependencies.
+  Use only the standard library at first to avoid module download failures.
+- Phase 3 (verify): run `go build ./...` after each meaningful addition.
+  If build breaks, fix it before adding more code.
+- DO NOT try to port ALL files in one pass — prioritize correctness over completeness.
+- DO NOT import third-party packages unless you have verified they are in go.sum
+  (run `go mod tidy` after `go get <pkg>` to update go.sum).
+- Plan: read spec/design doc (1-2 files max) → write go.mod → write minimal main.go
+  → build → iteratively add functionality → build after each addition → done().""",
             review_prompt="""Review the implementation:
 1. Does it satisfy the requirements?
 2. Does the code compile/run without errors?
@@ -275,8 +299,10 @@ CRITICAL RULES:
   NEW test files — do NOT modify or overwrite the existing production source code.
   If source code is missing a function, test only what EXISTS.
 - Do NOT attempt to run tests before writing them — write first, verify after
-- If tests fail with "expected X, got Y" — update expected value to Y. The code is
-  correct; your assumed expected value was wrong. Match what the code actually returns.
+- If tests fail with "expected X, got Y" — the source code is the ground truth, not
+  your assumption. Re-read the function under test to understand WHY it returns Y.
+  Then update your expected value to match what the code actually does. Do NOT
+  blindly swap the value — understand the behavior so other assertions are also correct.
 - When finished, call done() IMMEDIATELY. Do NOT write a text summary first —
   put your summary in the done() message argument instead.
 - If a bash command returns "(no output)", do NOT retry the same command with
@@ -297,6 +323,19 @@ When writing tests:
   do NOT write assertions expecting it to. Tests that assert unimplemented behavior will
   FAIL. When in doubt, test the happy path — verify output matches what the code returns
   for valid inputs, without assuming error handling for edge cases the code doesn't cover.
+- BEFORE writing any assertion, mentally trace through the function with your test input.
+  Check: does the function strip/normalize inputs? Does it add/remove prefixes? Does it
+  return a different type than you expect? Read the function body, not just its signature.
+- For DYNAMIC values (timestamps, UUIDs, auto-generated IDs, time.time()): NEVER
+  hardcode expected values. Instead assert the TYPE or use range checks:
+  `assert isinstance(result["created_at"], float)`, `assert result["id"] is not None`,
+  `assert 0 < result["created_at"] < time.time() + 1`. If a field uses `time.time()`,
+  the value changes every run — a hardcoded constant will always fail.
+- For UNORDERED collections (sets, dicts): do NOT use `pytest.approx()` which only
+  works on ordered sequences. Compare sets with `==`, or sort before comparing:
+  `assert sorted(actual) == sorted(expected)`.
+- Only call methods/functions that EXIST on the class. Before writing `obj.someMethod()`,
+  verify that method exists by reading the class source or running grep for the method name.
 - Test both success and failure scenarios
 - Test edge cases (null, empty, boundary values)
 - Use descriptive test names that explain what's being tested
@@ -307,18 +346,28 @@ LANGUAGE-SPECIFIC TEST CONVENTIONS (apply whichever matches the project):
 Go:
 - Test CODE files (`*_test.go`) MUST be in the SAME directory as the source file.
   CORRECT: source `pkg/parser.go` → test file path is `pkg/parser_test.go`
-  CORRECT: source `httpfile/reader.go` → test file path is `httpfile/reader_test.go`
+  CORRECT: source `pkg/reader.go` → test file path is `pkg/reader_test.go`
   WRONG: placing test code at the repo root when source is in a subdirectory
   WRONG: placing test code in a separate `tests/`, `test/`, or `testdata/` subdirectory
   If the source file you're testing is at `subdir/foo.go`, the test MUST be `subdir/foo_test.go`.
 - `testdata/` is ONLY for test fixture files (e.g., sample inputs, golden outputs).
   Never put `*_test.go` code inside `testdata/`. Test code reads FROM testdata, lives OUTSIDE it.
+- TESTDATA POPULATION: When using testdata convention, you MUST create the testdata/
+  directory AND write actual sample files into it. If your test opens a file like
+  `testdata/input.txt` or `testdata/sample.json`, that file must exist with valid
+  content. Tests that reference missing fixture files will fail with '[setup failed]'.
+  Read the test code to find which files it opens, then create each one with realistic
+  content (look for existing example files in the repo to use as templates).
+  Use `file_write` to create each fixture file.
 - Only test functions/methods that ACTUALLY EXIST in the source. Read the source
   first and enumerate real exported symbols — do NOT invent function names.
 - Package name: use the same package as source (e.g. `package parser`) or the
   black-box variant (`package parser_test`). Never a different package name.
 - Before running `go test`, first run `go build ./...` to catch compile errors quickly.
   Fix ALL build errors before attempting to run tests.
+  Test files are compiled with the package: `imported and not used` in `*_test.go` is a
+  compile error — remove unused imports (do not leave placeholder imports). After edits,
+  run `go test ./path/to/pkg/...` and fix diagnostics in test code before calling done().
   Before using any type in a test, verify its definition in the source — int enum types
   are NOT interchangeable with `error` or interface types without explicit conversion.
 - Run tests with: `go test ./...` from the repo root (NOT from a subdirectory)
@@ -337,14 +386,26 @@ Python:
   Check HTTP status codes with `assert r.status_code == 201`, read body with `r.json()`.
 - Use `pytest.raises(ExceptionType, match="pattern")` to assert exceptions.
 - Use `pytest.approx()` for floating-point equality: `assert result == pytest.approx(3.14)`.
-- For time-dependent tests, set `expires_at` to a past timestamp to simulate expiry.
+- When mocking/patching functions (monkeypatch, unittest.mock): the replacement must NOT
+  call the name being patched (that recurses). WRONG: `lambda: time.time() + 3600` after
+  patching `time.time`. RIGHT: save the real function object first:
+  `_real_time = time.time; monkeypatch.setattr(time, 'time', lambda: _real_time() + 3600)`.
+  Or freeze a scalar once: `t0 = time.time(); monkeypatch.setattr(time, 'time', lambda: t0)`.
+- For time-dependent tests, prefer freezing time to a fixed value rather than adding
+  offsets to `time.time()`, to avoid coupling tests to wall-clock time.
 - Run: `python -m pytest tests/ -v` or `pytest -v`.
 JavaScript/TypeScript:
 - Name test files `*.test.ts`, `*.spec.ts`, `*.test.js`, or `*.spec.js`.
 - Place test files alongside the source file they test (same directory) or in `__tests__/`.
-- For ts-jest projects: `describe()` + `it()` or `test()` blocks, `expect().toBe()` etc.
-- For code coverage: `npx jest --coverage` — check coverage output for line/function %.
-- Run: `npm test` or `npx jest --forceExit`.
+- Vitest: use `import {{ describe, it, expect }} from "vitest"` (or globals if configured).
+  Config file is often `vitest.config.ts`; ensure `vitest` is in devDependencies when adding tests.
+- Jest / ts-jest: `describe()` + `it()` or `test()`, `expect().toBe()`; match project's
+  existing preset (`jest.config.js`, `ts-jest` in tsconfig types if needed).
+- For coverage tasks: run the project's test script with coverage (`npm test -- --coverage`,
+  `npx vitest run --coverage`, or `npx jest --coverage` depending on package.json).
+- Async APIs: use `await` inside `it`/`test` marked async, or return the promise; use
+  `expect(await fn()).toBe(...)` as appropriate. Match the project's existing async style.
+- Run: `npm test` or `npx vitest run` or `npx jest --forceExit` — use whatever scripts exist.
 Java (Maven):
 - Mirror the source package structure under `src/test/java/` (Maven convention).
 - Annotate test class with nothing special; annotate methods with `@Test`.
@@ -352,6 +413,10 @@ Java (Maven):
 Java (Gradle):
 - Mirror the source package structure under `src/test/java/` (Gradle convention).
 - Use JUnit Jupiter: import `org.junit.jupiter.api.Test`, `org.junit.jupiter.api.Assertions.*`.
+- Before `new SomeClass(...)`, read that class source and match **constructors** exactly
+  (arity and parameter types). "required: String, found: no arguments" means you called a
+  constructor that does not exist — fix the argument list to match `public SomeClass(...)`
+  in the `.java` file, not what you assumed.
 - Run: `JAVA_HOME=$(mise where java@21) gradle test --no-daemon` (Gradle 8.x requires Java ≤21).
   If `mise` is not available, try: `gradle test --no-daemon`.
 - To detect if it's a Gradle project: check if `build.gradle` or `build.gradle.kts` exists.
@@ -363,6 +428,9 @@ Rust:
 - Run: `cargo test`""",
             planning_prompt="""Analyze the testing task and create a test plan:
 1. What code needs to be tested? (identify target files)
+   For Go: first run `go list ./...` to see all packages. The task description may
+   name a folder or package — your *_test.go MUST go in that folder alongside the
+   source files, NOT at the repo root. Run `ls <folder>/` to confirm source files are there.
 2. What testing framework is being used? (pytest, jest, go test, junit, etc.)
 3. Where should tests be placed? (apply language-specific conventions above)
 4. Discover actual public symbols AND field types before writing ANY test code:
@@ -371,7 +439,12 @@ Rust:
           For each struct field, note the TYPE (string, int, *url.URL, etc.) BEFORE writing
           assertions. If a field is `*url.URL`, compare with `.String()` not `== ""`.
           If a field is `*net.IP`, use `.String()` not direct string comparison.
-   Python: `grep -n "^def \|^class " <source>.py` — list public functions/classes
+   Python: `grep -n "^def \\|^class " <source>.py` — list public functions/classes.
+          For each function, note its RETURN TYPE before writing assertions:
+          - If it returns a custom class (not list/dict), check that class for `__getitem__`.
+            If the class lacks `__getitem__`, use `list(result)[0]` not `result[0]`.
+          - Use `grep -n "__getitem__\\|def values\\|def items\\|def __iter__" <source>.py`
+            to discover how to iterate/access results before writing subscript assertions.
    TS/JS:  `grep -n "^export " <source>.ts` — list exported symbols
    Java:   `grep -n "public " <source>.java` — list public methods
    NEVER guess symbol names or field types — only use what grep shows from the actual source.

@@ -28,6 +28,8 @@ class ChatResponse:
     text: str = ""
     tool_call: Optional[ToolCall] = None
     raw: Dict[str, Any] = field(default_factory=dict)
+    # True when the server rejected the request for context/token limits (recover by trimming).
+    context_window_error: bool = False
 
     @property
     def is_tool_call(self) -> bool:
@@ -56,8 +58,8 @@ class LLMManager:
         self.temperature = config.temperature
         self.num_predict = config.num_predict
 
-        # Retry settings for transient failures
-        self.max_retries = getattr(config, "max_retries", 5)
+        # Retry settings for transient failures (model reloads can exceed short backoff windows)
+        self.max_retries = getattr(config, "max_retries", 7)  # see AgentConfig.max_retries
         self.retry_base_delay = 2  # seconds — jittered exponential (2, 4, 8, 16, 32…)
 
         # Setup dedicated LLM logger
@@ -146,6 +148,24 @@ class LLMManager:
         "ConnectionError", "ConnectionRefusedError", "ConnectionResetError",
         "Timeout", "ReadTimeout", "ConnectTimeout",
     )
+
+    @staticmethod
+    def _is_context_window_failure(status_code: int, body: str) -> bool:
+        """Detect HTTP errors caused by prompt/context exceeding model limits."""
+        b = (body or "").lower()
+        hints = (
+            "context length", "maximum context", "token limit", "too many tokens",
+            "exceeds the context", "context window", "max token", "maximum token",
+            "prompt is too long", "input length", "too long",
+            "requested token", "reduce the length", "context overflow",
+        )
+        if status_code == 413:
+            return True
+        if status_code in (400, 422) and any(h in b for h in hints):
+            return True
+        if status_code == 500 and any(h in b for h in hints):
+            return True
+        return False
 
     def _request_with_retry(self, method: str, url: str, **kwargs):
         """HTTP request with exponential backoff for transient failures.
@@ -435,8 +455,14 @@ class LLMManager:
                 )
 
             if resp.status_code != 200:
-                body = resp.text[:500]
-                logger.error("LLM error %s: %s", resp.status_code, body)
+                body = resp.text[:2000]
+                if self._is_context_window_failure(resp.status_code, body):
+                    logger.warning(
+                        "LLM context window exceeded (%s) — caller should trim and retry",
+                        resp.status_code,
+                    )
+                    return ChatResponse(context_window_error=True, raw={"status": resp.status_code})
+                logger.error("LLM error %s: %s", resp.status_code, body[:500])
                 return ChatResponse()
 
             data = resp.json()

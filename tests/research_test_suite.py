@@ -979,6 +979,8 @@ def _run_single_benchmark(
     llm_url: str,
     model: str,
     timeout_minutes: int,
+    embed_model: str = "",
+    embed_dims: int = 768,
 ) -> TestResult:
     """Run the agent against a single benchmark task in an isolated temp dir."""
     src = BENCHMARK_ROOT / task.benchmark_dir
@@ -1016,16 +1018,19 @@ def _run_single_benchmark(
 
         # Run the agent
         timeout_sec = timeout_minutes * 60
+        agent_cmd = [
+            sys.executable, str(AGENT_SCRIPT),
+            "--repo", str(repo),
+            "--tasks-dir", str(tasks_dir),
+            "--llm-url", llm_url,
+            "--model", model,
+            "--max-iterations", "3",
+            "--no-verify",
+        ]
+        if embed_model:
+            agent_cmd += ["--embed-model", embed_model, "--embed-dims", str(embed_dims)]
         result = subprocess.run(
-            [
-                sys.executable, str(AGENT_SCRIPT),
-                "--repo", str(repo),
-                "--tasks-dir", str(tasks_dir),
-                "--llm-url", llm_url,
-                "--model", model,
-                "--max-iterations", "3",
-                "--no-verify",
-            ],
+            agent_cmd,
             cwd=str(AGENT_ROOT),
             capture_output=True,
             text=True,
@@ -1096,6 +1101,14 @@ def main():
                         help="Write JSON report to file")
     parser.add_argument("--parallel", type=int, default=1, metavar="N",
                         help="Run up to N benchmark tasks concurrently (default: 1)")
+    parser.add_argument("--embed-model",
+                        default=os.environ.get("EMBED_MODEL", ""),
+                        help="Embedding model for vector memory (e.g. text-embedding-nomic-embed-text-v1.5). "
+                             "Reads EMBED_MODEL env var if not set.")
+    parser.add_argument("--embed-dims", type=int,
+                        default=int(os.environ.get("EMBED_DIMS", "768")),
+                        help="Embedding dimensions matching the model (default: 768). "
+                             "Reads EMBED_DIMS env var if not set.")
     args = parser.parse_args()
 
     from datetime import datetime, timezone
@@ -1133,7 +1146,10 @@ def main():
             for task in tasks_to_run:
                 timeout = args.timeout if args.timeout else task.timeout_minutes
                 _log(f"  Starting: {task.name} (timeout: {timeout}m)...")
-                result = _run_single_benchmark(task, args.llm_url, args.model, timeout)
+                result = _run_single_benchmark(
+                    task, args.llm_url, args.model, timeout,
+                    embed_model=args.embed_model, embed_dims=args.embed_dims,
+                )
                 report.benchmark_results.append(result)
                 status = "PASS" if result.passed else "FAIL"
                 _log(f"  [{status}] {task.name}  ({result.elapsed_seconds:.0f}s)")
@@ -1143,7 +1159,10 @@ def main():
             def _run(task: BenchmarkTask) -> TestResult:
                 timeout = args.timeout if args.timeout else task.timeout_minutes
                 _log(f"  Starting: {task.name} (timeout: {timeout}m)...")
-                r = _run_single_benchmark(task, args.llm_url, args.model, timeout)
+                r = _run_single_benchmark(
+                    task, args.llm_url, args.model, timeout,
+                    embed_model=args.embed_model, embed_dims=args.embed_dims,
+                )
                 status = "PASS" if r.passed else "FAIL"
                 _log(f"  [{status}] {task.name}  ({r.elapsed_seconds:.0f}s)")
                 return r

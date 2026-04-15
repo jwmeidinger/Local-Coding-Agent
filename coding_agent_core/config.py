@@ -38,7 +38,8 @@ class AgentConfig:
     
     # Execution settings
     max_iterations: int = 5
-    max_retries: int = 2
+    # Transient LLM HTTP retries (connection drops, 5xx, model reload windows)
+    max_retries: int = 7
     max_consecutive_errors: int = 2  # Bail after N consecutive LLM failures
     auto_commit: bool = True
     verbose: bool = False
