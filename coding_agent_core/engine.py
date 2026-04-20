@@ -22,6 +22,8 @@ from .tools import SystemUpgradeGuard, ToolRegistry
 
 class ExecutionEngine:
     """Core execution engine - the brain of the agent."""
+    _MEMORY_MIN_SIMILARITY = 0.22
+    _FAILURE_MEMORY_MIN_SIMILARITY = 0.3
     
     def __init__(self, config: AgentConfig, repo, repo_path: Path):
         self.config = config
@@ -155,6 +157,84 @@ class ExecutionEngine:
                 self.logger.info("Other candidates:")
                 for cmd, source in candidates[1:]:
                     self.logger.info(f"  {cmd}  (from {source})")
+
+    @staticmethod
+    def _memory_recency_bonus(created_at: object, horizon_days: int = 14) -> float:
+        """Return a small bonus for recent memories; stale memories get none."""
+        if not created_at:
+            return 0.0
+        if isinstance(created_at, datetime):
+            created_dt = created_at
+        elif isinstance(created_at, str):
+            try:
+                created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            except Exception:
+                return 0.0
+        else:
+            return 0.0
+        age_days = max(
+            0.0,
+            (datetime.now(created_dt.tzinfo) - created_dt).total_seconds() / 86400.0
+        )
+        if age_days >= horizon_days:
+            return 0.0
+        return (1.0 - (age_days / horizon_days)) * 0.1
+
+    def _select_relevant_memories(
+        self,
+        runs: list[dict],
+        *,
+        min_similarity: float,
+        max_runs: int,
+        prefer_success: bool = True,
+        require_actionable: bool = False,
+    ) -> list[dict]:
+        """Rank and filter memory runs to reduce stale/irrelevant context injection."""
+        ranked: list[tuple[float, dict]] = []
+        for run in runs:
+            similarity = float(run.get("similarity") or 0.0)
+            if similarity < min_similarity:
+                continue
+            has_actionable_detail = bool(
+                (run.get("resolution") or "").strip()
+                or (run.get("failure_summary") or "").strip()
+                or (run.get("execution_log") or "").strip()
+            )
+            if require_actionable and not has_actionable_detail:
+                continue
+
+            outcome = str(run.get("outcome") or "unknown").lower()
+            outcome_bonus = 0.0
+            if prefer_success:
+                if outcome == "success":
+                    outcome_bonus = 0.12
+                elif outcome == "partial":
+                    outcome_bonus = 0.04
+                elif outcome == "failure":
+                    outcome_bonus = -0.06
+            elif outcome == "failure":
+                outcome_bonus = 0.08
+
+            actionable_bonus = 0.05 if has_actionable_detail else 0.0
+            recency_bonus = self._memory_recency_bonus(run.get("created_at"))
+            score = (similarity * 0.75) + outcome_bonus + actionable_bonus + recency_bonus
+            ranked.append((score, run))
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+
+        selected: list[dict] = []
+        seen_signatures: set[tuple[str, str]] = set()
+        for _, run in ranked:
+            failure_type = str(run.get("failure_type") or "")
+            task_prefix = str(run.get("task_description") or "")[:90].strip().lower()
+            signature = (failure_type, task_prefix)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            selected.append(run)
+            if len(selected) >= max_runs:
+                break
+        return selected
 
     def _get_project_summary(self) -> str:
         """Read key project config files and return a brief summary for context.
@@ -499,14 +579,21 @@ class ExecutionEngine:
                         similar_failures = self.memory_manager.find_similar_failures(
                             ft, context.task_description, limit=2
                         )
-                        if similar_failures:
-                            past_ctx = self.memory_manager.format_past_runs(similar_failures)
+                        relevant_failures = self._select_relevant_memories(
+                            similar_failures,
+                            min_similarity=self._FAILURE_MEMORY_MIN_SIMILARITY,
+                            max_runs=2,
+                            prefer_success=False,
+                            require_actionable=True,
+                        )
+                        if relevant_failures:
+                            past_ctx = self.memory_manager.format_past_runs(relevant_failures)
                             context.review_feedback += (
                                 f"\n\n{past_ctx}"
                             )
                             self.logger.info(
                                 "Injected %d similar past failures into replan context",
-                                len(similar_failures),
+                                len(relevant_failures),
                             )
                     except Exception as e:
                         self.logger.warning(f"Past-failure retrieval failed: {e}")
@@ -802,14 +889,20 @@ class ExecutionEngine:
         if self.memory_manager:
             try:
                 past_runs = self.memory_manager.find_similar_tasks(
-                    context.task_description, limit=3
+                    context.task_description, limit=6
                 )
-                # Only include runs with meaningful similarity
-                relevant = [r for r in past_runs if r.get("similarity", 0) > 0.3]
+                relevant = self._select_relevant_memories(
+                    past_runs,
+                    min_similarity=self._MEMORY_MIN_SIMILARITY,
+                    max_runs=3,
+                    prefer_success=True,
+                    require_actionable=False,
+                )
                 if relevant:
                     past_runs_context = self.memory_manager.format_past_runs(relevant)
                     self.logger.info(
-                        "Found %d relevant past runs for planning", len(relevant)
+                        "Found %d similar past run memories for planning context",
+                        len(relevant),
                     )
             except Exception as e:
                 self.logger.warning(f"Past-run retrieval failed: {e}")
@@ -871,6 +964,7 @@ RULES:
         file_tree = self.tools.execute('file_tree(path=".")')
 
         relevant_files = []
+        relevant_failures: list[dict] = []
         if self.memory_manager:
             try:
                 results = self.memory_manager.search_codebase(
@@ -880,6 +974,23 @@ RULES:
                 relevant_files = [r['file_path'] for r in results if r['combined_score'] > 0.5]
             except Exception as e:
                 self.logger.warning(f"Could not search codebase: {e}")
+            try:
+                past_runs = self.memory_manager.find_similar_tasks(
+                    context.task_description, limit=6
+                )
+                failure_runs = [
+                    r for r in past_runs
+                    if (r.get("failure_summary") or r.get("failure_type"))
+                ]
+                relevant_failures = self._select_relevant_memories(
+                    failure_runs,
+                    min_similarity=self._FAILURE_MEMORY_MIN_SIMILARITY,
+                    max_runs=2,
+                    prefer_success=False,
+                    require_actionable=True,
+                )
+            except Exception as e:
+                self.logger.warning(f"Could not retrieve failure memories: {e}")
 
         memory_context = ""
         if relevant_files:
@@ -887,6 +998,26 @@ RULES:
 {chr(10).join([f"  - {f}" for f in relevant_files[:5]])}
 
 """
+        if relevant_failures:
+            failure_tips = []
+            for run in relevant_failures:
+                fail = (run.get("failure_summary") or run.get("failure_type") or "").strip()
+                fix = (run.get("resolution") or "").strip()
+                snippet = fail[:120]
+                if fix:
+                    snippet += f" -> {fix[:120]}"
+                if snippet:
+                    failure_tips.append(f"  - {snippet}")
+            if failure_tips:
+                self.logger.info(
+                    "Injected %d similar past failure pattern(s) into execution context",
+                    len(failure_tips),
+                )
+                memory_context += (
+                    "Known Failure Patterns From Similar Tasks (avoid repeating):\n"
+                    + "\n".join(failure_tips)
+                    + "\n\n"
+                )
 
         plan_text = context.plan or ""
         if len(plan_text) > 3000:

@@ -601,7 +601,12 @@ class VectorMemoryManager:
         self.logger.info("Memory update complete")
     
     def find_similar_tasks(self, query: str, embedding_model: Any = None, limit: int = 5) -> List[Dict]:
-        """Find similar past tasks."""
+        """Find similar past tasks.
+
+        Task memory is matched **across** repo_path values so learning transfers
+        between short-lived worktrees (benchmarks, fresh clones). Code/file
+        embeddings remain scoped per repo in ``code_embeddings``.
+        """
         query_embedding = self._generate_embedding(query, embedding_model)
         
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -620,11 +625,10 @@ class VectorMemoryManager:
                     created_at,
                     1 - (embedding <=> %s::vector) AS similarity
                 FROM task_memory
-                WHERE repo_path = %s
-                AND embedding IS NOT NULL
+                WHERE embedding IS NOT NULL
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
-            """, (query_embedding, str(self.repo_path), query_embedding, limit))
+            """, (query_embedding, query_embedding, limit))
             
             return [dict(row) for row in cur.fetchall()]
 
@@ -652,12 +656,11 @@ class VectorMemoryManager:
                     created_at,
                     1 - (embedding <=> %s::vector) AS similarity
                 FROM task_memory
-                WHERE repo_path = %s
-                AND failure_type = %s
+                WHERE failure_type = %s
                 AND embedding IS NOT NULL
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
-            """, (query_embedding, str(self.repo_path), failure_type, query_embedding, limit))
+            """, (query_embedding, failure_type, query_embedding, limit))
 
             return [dict(row) for row in cur.fetchall()]
 
