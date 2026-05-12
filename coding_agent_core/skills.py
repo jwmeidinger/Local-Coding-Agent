@@ -524,6 +524,7 @@ Respond with:
             "architecture", "architectural",
             "architecture map", "architecture diagram", "architecture flow",
             "flow diagram", "flow map", "data flow diagram",
+            "request flow", "execution flow", "control flow", "call graph",
             "mermaid", "mermaid.js", "mermaidjs",
             "c4 diagram", "c4 model",
             "system context", "system overview",
@@ -532,7 +533,13 @@ Respond with:
             "high-level overview", "high-level architecture",
             "map the codebase", "map the repo", "map the repository",
             "diagram the codebase", "diagram the system",
+            "diagram the state", "diagram the flow", "diagram the data",
             "visualize the architecture",
+            "sequence diagram", "sequencediagram",
+            "class diagram", "classdiagram",
+            "er diagram", "erdiagram", "entity relationship",
+            "state diagram", "statediagram", "state machine",
+            "uml diagram", "deployment diagram",
         ],
     }
 

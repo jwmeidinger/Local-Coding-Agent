@@ -1317,18 +1317,20 @@ class WebSearchTool:
 class MermaidLintTool:
     """Validate the syntax of Mermaid diagrams embedded in a Markdown file.
 
-    Performs a lightweight static check that catches the most common breakages
-    we see from local LLMs:
-      - missing or unbalanced ```mermaid fences
-      - missing `graph <DIR>` header
-      - inline `:::` styling (not supported on older Mermaid renderers)
-      - subgraph/end imbalance
-      - node IDs containing whitespace or punctuation
-      - edges referencing undeclared node IDs
+    Supports all diagram types used by the ``architecture`` skill:
+      - flowchart / graph TD|LR|...      (strict node + subgraph checks)
+      - sequenceDiagram                  (alt/loop/opt/par/critical/break balance)
+      - classDiagram                     (brace balance)
+      - erDiagram                        (header + universal rules)
+      - stateDiagram(-v2)                (brace balance)
 
-    This is intentionally a syntactic linter, not a full parser. It only flags
-    issues that would prevent the diagram from rendering or that violate the
-    style rules required by the `architecture` skill.
+    For every diagram type the universal rules are enforced (fence closed,
+    no inline ``:::`` styling). Diagram-specific rules layer on top.
+
+    This is a lightweight static linter, not a full parser. The goal is to
+    catch the breakages local LLMs commonly produce: missing headers,
+    unbalanced block keywords, IDs that contain spaces/punctuation, and
+    references to undeclared nodes.
     """
     name = "mermaid_lint"
     description = "Lint Mermaid diagrams in a Markdown file. Returns 'OK' or a list of issues."
@@ -1336,10 +1338,10 @@ class MermaidLintTool:
     schema = {
         "name": "mermaid_lint",
         "description": (
-            "Validate the Mermaid diagram(s) in a Markdown file. "
-            "Returns 'OK' if all diagrams parse with the strict rules used by "
-            "the architecture skill, otherwise returns a list of issues with "
-            "line numbers so they can be fixed."
+            "Validate the Mermaid diagram(s) in a Markdown file. Supports "
+            "graph/flowchart, sequenceDiagram, classDiagram, erDiagram, and "
+            "stateDiagram. Returns 'OK' if all diagrams pass, otherwise a "
+            "list of issues with line numbers so they can be fixed."
         ),
         "parameters": {
             "type": "object",
@@ -1354,11 +1356,16 @@ class MermaidLintTool:
     }
 
     # Mermaid keywords that should NOT be treated as node IDs when we scan
-    # for undeclared references.
-    _KEYWORDS = {
+    # flowcharts for undeclared references.
+    _FLOWCHART_KEYWORDS = {
         "graph", "flowchart", "subgraph", "end", "classDef", "class",
         "linkStyle", "click", "direction", "TD", "TB", "BT", "RL", "LR",
         "style",
+    }
+
+    # Sequence-diagram block-opener keywords that must each be closed by `end`.
+    _SEQUENCE_BLOCK_OPENERS = {
+        "loop", "alt", "opt", "par", "critical", "break", "rect", "box",
     }
 
     def __init__(self, cwd: Path = None):
@@ -1415,13 +1422,30 @@ class MermaidLintTool:
             i += 1
         return blocks
 
+    @staticmethod
+    def _parse_diagram_type(header: str) -> Optional[str]:
+        """Map a header line to a diagram-type tag, or None if unrecognized."""
+        if not header:
+            return None
+        if re.match(r'^(graph|flowchart)\s+(TD|TB|BT|RL|LR)\b', header):
+            return "flowchart"
+        if re.match(r'^sequenceDiagram\b', header):
+            return "sequence"
+        if re.match(r'^classDiagram(-v2)?\b', header):
+            return "class"
+        if re.match(r'^erDiagram\b', header):
+            return "er"
+        if re.match(r'^stateDiagram(-v2)?\b', header):
+            return "state"
+        return None
+
     def _lint_block(self, body: str, start_line: int) -> list[str]:
         issues: list[str] = []
         lines = body.splitlines()
-        if not lines:
+        if not lines or not any(ln.strip() for ln in lines):
             return ["empty mermaid block"]
 
-        # Find the first non-blank, non-comment line — it must be the graph header.
+        # Find the first non-blank, non-comment line — it should be the header.
         header = None
         for ln in lines:
             s = ln.strip()
@@ -1429,19 +1453,51 @@ class MermaidLintTool:
                 continue
             header = s
             break
-        if not header or not re.match(r'^(graph|flowchart)\s+(TD|TB|BT|RL|LR)\b', header):
-            issues.append(
-                "first non-blank line must be `graph TD` (or another valid "
-                f"`graph <DIR>` / `flowchart <DIR>`), got: {header!r}"
-            )
 
-        # Inline classDef application via `:::class` is rejected for portability.
+        diagram_type = self._parse_diagram_type(header) if header else None
+        if not diagram_type:
+            issues.append(
+                "first non-blank line must be a recognized Mermaid header: "
+                "`graph TD|LR|...`, `flowchart TD|...`, `sequenceDiagram`, "
+                "`classDiagram`, `erDiagram`, or `stateDiagram-v2`. "
+                f"Got: {header!r}"
+            )
+            return issues
+
+        # Universal rule: no inline `:::` styling. (Originally a flowchart
+        # concern, but the architecture skill forbids it everywhere for
+        # portability, so we check it universally.)
         for i, ln in enumerate(lines, start=start_line):
             if ":::" in ln:
                 issues.append(
                     f"line {i}: inline ':::' class styling is not allowed "
-                    "(use `class NodeA,NodeB level1` at the bottom instead)"
+                    "(use `class NodeA,NodeB className` at the bottom for "
+                    "flowcharts; do not use inline class refs in other "
+                    "diagram types)"
                 )
+
+        # Dispatch to type-specific linter.
+        if diagram_type == "flowchart":
+            issues.extend(self._lint_flowchart(lines, start_line))
+        elif diagram_type == "sequence":
+            issues.extend(self._lint_sequence(lines, start_line))
+        elif diagram_type == "class":
+            issues.extend(self._lint_braces(lines, start_line, "classDiagram"))
+        elif diagram_type == "state":
+            issues.extend(self._lint_braces(lines, start_line, "stateDiagram"))
+        elif diagram_type == "er":
+            # erDiagram is intentionally permissive — header check + universal
+            # rules above are enough. Mermaid's ER syntax is small and the
+            # most common breakage is just a missing header.
+            pass
+
+        return issues
+
+    # ------------------------------------------------------------------
+    # Flowchart-specific lint (the original, strict checker).
+    # ------------------------------------------------------------------
+    def _lint_flowchart(self, lines: list[str], start_line: int) -> list[str]:
+        issues: list[str] = []
 
         # Subgraph / end balance.
         open_subgraphs = 0
@@ -1449,7 +1505,6 @@ class MermaidLintTool:
             s = ln.strip()
             if re.match(r'^subgraph\b', s):
                 open_subgraphs += 1
-                # Subgraph ID must be ASCII (token right after 'subgraph')
                 m = re.match(r'^subgraph\s+([^\s\[\(]+)', s)
                 if m and not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', m.group(1)):
                     issues.append(
@@ -1466,37 +1521,28 @@ class MermaidLintTool:
 
         # Collect declared node IDs and edges.
         declared: set[str] = set()
-        edge_refs: list[tuple[int, str, str]] = []  # (line, src, dst)
+        edge_refs: list[tuple[int, str, str]] = []
 
-        # A node declaration is any token that appears before `[`, `(`, `{`, `>` or stands alone on a line
-        # (excluding keywords and class lines).
         for i, ln in enumerate(lines, start=start_line):
             s = ln.strip()
             if not s or s.startswith("%%"):
                 continue
             if re.match(r'^(graph|flowchart|subgraph|end|classDef|class|linkStyle|click|direction|style)\b', s):
-                # classDef / class lines: collect node IDs from `class A,B level1`
                 m = re.match(r'^class\s+([A-Za-z0-9_,\s]+)\s+\w+', s)
                 if m:
                     for nid in m.group(1).split(","):
                         nid = nid.strip()
                         if nid:
-                            edge_refs.append((i, nid, nid))  # treat as reference too
+                            edge_refs.append((i, nid, nid))
                 continue
 
-            # Split on edge operators to find endpoints. Mermaid edge ops:
-            # -->, --x, --o, -.->, ==>, ---, -.-, ===
             edge_split = re.split(r'\s*(?:-->|---|--x|--o|-\.->|-\.-|==>|===)\s*', s)
             tokens = [t.strip() for t in edge_split if t.strip()]
 
-            # Declare each endpoint and capture the bare ID.
             endpoint_ids: list[str] = []
             for tok in tokens:
-                # Strip an optional edge label like `-- "foo" -->` residue.
-                # An endpoint looks like:  ID  or  ID["Label"]  or  ID("Label")  or  ID{"Label"}
                 m = re.match(r'^([A-Za-z][A-Za-z0-9_]*)(\s*[\[\(\{].*)?$', tok)
                 if not m:
-                    # Could be an edge label fragment in quotes, skip silently.
                     if not (tok.startswith('"') and tok.endswith('"')):
                         issues.append(
                             f"line {i}: cannot parse token {tok!r} as a node id "
@@ -1504,25 +1550,107 @@ class MermaidLintTool:
                         )
                     continue
                 nid = m.group(1)
-                if nid in self._KEYWORDS:
+                if nid in self._FLOWCHART_KEYWORDS:
                     continue
                 declared.add(nid)
                 endpoint_ids.append(nid)
 
-            # If we found 2+ endpoints, record edges between consecutive ones.
             for a, b in zip(endpoint_ids, endpoint_ids[1:]):
                 edge_refs.append((i, a, b))
 
-        # Verify every edge references a declared node. (declared was populated
-        # from the same scan, so this mainly catches typos via `class` lines.)
         for ln_no, a, b in edge_refs:
             for nid in (a, b):
-                if nid and nid not in declared and nid not in self._KEYWORDS:
+                if nid and nid not in declared and nid not in self._FLOWCHART_KEYWORDS:
                     issues.append(
                         f"line {ln_no}: node id {nid!r} is referenced but never declared "
                         "(add it as `NodeId[\"Label\"]` somewhere in the diagram)"
                     )
 
+        return issues
+
+    # ------------------------------------------------------------------
+    # sequenceDiagram-specific lint.
+    # ------------------------------------------------------------------
+    def _lint_sequence(self, lines: list[str], start_line: int) -> list[str]:
+        """Balance the block keywords (loop/alt/opt/par/critical/break/rect/box)
+        against their closing `end`, and sanity-check participant declarations."""
+        issues: list[str] = []
+        # Stack of (opener_keyword, line_no) so we can name what's unclosed.
+        stack: list[tuple[str, int]] = []
+
+        for i, ln in enumerate(lines, start=start_line):
+            s = ln.strip()
+            if not s or s.startswith("%%"):
+                continue
+            # Skip the header line — already validated.
+            if re.match(r'^sequenceDiagram\b', s):
+                continue
+
+            first_token = s.split(None, 1)[0]
+            if first_token in self._SEQUENCE_BLOCK_OPENERS:
+                stack.append((first_token, i))
+                continue
+            if first_token == "end":
+                if not stack:
+                    issues.append(
+                        f"line {i}: stray `end` without a matching "
+                        "`loop`/`alt`/`opt`/`par`/`critical`/`break`/`rect`/`box`"
+                    )
+                else:
+                    stack.pop()
+                continue
+
+            # Participant / actor declaration syntax check.
+            m = re.match(r'^(participant|actor)\s+(\S+)(\s+as\s+.+)?\s*$', s)
+            if m:
+                pid = m.group(2)
+                if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', pid):
+                    issues.append(
+                        f"line {i}: participant/actor id {pid!r} must be ASCII letters/digits/underscore "
+                        "(use `participant A as \"Display Name\"` to give it a friendly label)"
+                    )
+
+        for opener, line_no in stack:
+            issues.append(
+                f"line {line_no}: unclosed `{opener}` block — add a matching `end`"
+            )
+        return issues
+
+    # ------------------------------------------------------------------
+    # classDiagram / stateDiagram brace balance.
+    # ------------------------------------------------------------------
+    def _lint_braces(self, lines: list[str], start_line: int, diagram_label: str) -> list[str]:
+        """Verify `{` / `}` are balanced. Ignores braces inside double-quoted strings."""
+        issues: list[str] = []
+        depth = 0
+        first_unmatched_line: Optional[int] = None
+
+        for i, ln in enumerate(lines, start=start_line):
+            in_string = False
+            for ch in ln:
+                if ch == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == "{":
+                    if depth == 0:
+                        first_unmatched_line = i
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth < 0:
+                        issues.append(
+                            f"line {i}: stray `}}` without a matching `{{` in {diagram_label}"
+                        )
+                        depth = 0
+
+        if depth > 0:
+            where = f"opened near line {first_unmatched_line}" if first_unmatched_line else "in this block"
+            issues.append(
+                f"unbalanced braces in {diagram_label}: {depth} `{{` "
+                f"never closed ({where}) — add the missing `}}`"
+            )
         return issues
 
 
