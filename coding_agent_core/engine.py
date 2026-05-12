@@ -855,6 +855,73 @@ class ExecutionEngine:
                     self.logger.warning(f"Could not restore stash: {stash_err}")
             raise RuntimeError(f"Failed to create branch: {e}") from e
     
+    # Manifest / config files that anchor a Level-1 / Level-2 architecture map.
+    # When the `architecture` skill is active, we pre-load the *content* of any
+    # of these that exist so the plan is grounded in real external dependencies,
+    # not just filenames.
+    _ARCHITECTURE_MANIFESTS: tuple[str, ...] = (
+        "package.json",
+        "pnpm-workspace.yaml",
+        "requirements.txt",
+        "pyproject.toml",
+        "Pipfile",
+        "setup.py",
+        "go.mod",
+        "Cargo.toml",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "composer.json",
+        "Gemfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "Dockerfile",
+        ".env.example",
+        ".env.sample",
+    )
+
+    # Max characters per manifest we inline into the planning prompt.
+    _ARCHITECTURE_MANIFEST_CHAR_BUDGET = 1500
+    # Max number of manifest files we pre-load (keeps the prompt bounded).
+    _ARCHITECTURE_MANIFEST_LIMIT = 6
+
+    def _collect_architecture_manifests(self) -> str:
+        """Return a pre-loaded snippet of manifest/config files for architecture planning.
+
+        Returns an empty string if no manifests are found. Files are read in
+        the order listed in :pyattr:`_ARCHITECTURE_MANIFESTS` and truncated
+        individually so a single huge file can't blow out the prompt budget.
+        """
+        snippets: list[str] = []
+        count = 0
+        for name in self._ARCHITECTURE_MANIFESTS:
+            if count >= self._ARCHITECTURE_MANIFEST_LIMIT:
+                break
+            path = self.repo_path / name
+            if not path.is_file():
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                self.logger.debug(f"Could not read manifest {name}: {e}")
+                continue
+            if len(content) > self._ARCHITECTURE_MANIFEST_CHAR_BUDGET:
+                content = (
+                    content[: self._ARCHITECTURE_MANIFEST_CHAR_BUDGET]
+                    + f"\n...(truncated; {len(content) - self._ARCHITECTURE_MANIFEST_CHAR_BUDGET} chars omitted)"
+                )
+            snippets.append(f"### {name}\n```\n{content}\n```")
+            count += 1
+
+        if not snippets:
+            return ""
+        return (
+            "## Manifest & Config Files (pre-loaded — use these to identify "
+            "external dependencies, entry points, and services)\n"
+            + "\n\n".join(snippets)
+            + "\n"
+        )
+
     def _create_plan(self, context: TaskContext, skill: Skill) -> str:
         """Create an execution plan grounded in the actual file tree.
 
@@ -863,6 +930,17 @@ class ExecutionEngine:
         # Always get the real file tree so the plan is grounded
         file_tree = self.tools.execute('file_tree(path=".")')
         self.logger.info("File tree collected for planning phase")
+
+        # For architecture tasks, pre-load the content of manifest/config files
+        # so the plan can reference real external dependencies and entry points
+        # instead of guessing from directory names alone.
+        manifest_context = ""
+        if skill.name == "architecture":
+            manifest_context = self._collect_architecture_manifests()
+            if manifest_context:
+                self.logger.info(
+                    "Pre-loaded manifest files for architecture planning"
+                )
 
         # Optionally enrich with vector search results
         context_info = ""
@@ -912,7 +990,7 @@ class ExecutionEngine:
 ## Project File Tree (REAL — use only these paths)
 {file_tree}
 
-{context_info}{past_runs_context}{skill.planning_prompt.format(task_description=context.task_description)}
+{manifest_context}{context_info}{past_runs_context}{skill.planning_prompt.format(task_description=context.task_description)}
 
 RULES:
 - Only reference files that appear in the file tree above.

@@ -1314,6 +1314,218 @@ class WebSearchTool:
             return None
 
 
+class MermaidLintTool:
+    """Validate the syntax of Mermaid diagrams embedded in a Markdown file.
+
+    Performs a lightweight static check that catches the most common breakages
+    we see from local LLMs:
+      - missing or unbalanced ```mermaid fences
+      - missing `graph <DIR>` header
+      - inline `:::` styling (not supported on older Mermaid renderers)
+      - subgraph/end imbalance
+      - node IDs containing whitespace or punctuation
+      - edges referencing undeclared node IDs
+
+    This is intentionally a syntactic linter, not a full parser. It only flags
+    issues that would prevent the diagram from rendering or that violate the
+    style rules required by the `architecture` skill.
+    """
+    name = "mermaid_lint"
+    description = "Lint Mermaid diagrams in a Markdown file. Returns 'OK' or a list of issues."
+
+    schema = {
+        "name": "mermaid_lint",
+        "description": (
+            "Validate the Mermaid diagram(s) in a Markdown file. "
+            "Returns 'OK' if all diagrams parse with the strict rules used by "
+            "the architecture skill, otherwise returns a list of issues with "
+            "line numbers so they can be fixed."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the Markdown file containing the ```mermaid fenced block(s)."
+                }
+            },
+            "required": ["path"]
+        }
+    }
+
+    # Mermaid keywords that should NOT be treated as node IDs when we scan
+    # for undeclared references.
+    _KEYWORDS = {
+        "graph", "flowchart", "subgraph", "end", "classDef", "class",
+        "linkStyle", "click", "direction", "TD", "TB", "BT", "RL", "LR",
+        "style",
+    }
+
+    def __init__(self, cwd: Path = None):
+        self.cwd = cwd or Path(".")
+
+    def execute(self, path: str) -> str:
+        try:
+            file_path = Path(path)
+            if not file_path.is_absolute():
+                file_path = self.cwd / file_path
+            if not file_path.exists():
+                return f"Error: File '{path}' not found."
+
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return f"Error reading file: {e}"
+
+        blocks = self._extract_mermaid_blocks(content)
+        if not blocks:
+            return (
+                "ISSUES:\n"
+                "- No ```mermaid fenced block found in the file. "
+                "The output must contain a fenced ```mermaid ... ``` block."
+            )
+
+        all_issues: list[str] = []
+        for idx, (start_line, body) in enumerate(blocks, 1):
+            issues = self._lint_block(body, start_line)
+            if issues:
+                prefix = f"Block #{idx} (starts at line {start_line}):"
+                all_issues.append(prefix)
+                all_issues.extend(f"  - {iss}" for iss in issues)
+
+        if all_issues:
+            return "ISSUES:\n" + "\n".join(all_issues)
+        return f"OK: {len(blocks)} Mermaid block(s) passed the lint."
+
+    @staticmethod
+    def _extract_mermaid_blocks(content: str) -> list[tuple[int, str]]:
+        """Extract all ```mermaid ... ``` blocks. Returns [(start_line, body), ...]."""
+        blocks = []
+        lines = content.splitlines()
+        i = 0
+        while i < len(lines):
+            stripped = lines[i].strip()
+            if stripped.startswith("```mermaid"):
+                start = i + 1  # 1-indexed line where the body begins
+                body_lines: list[str] = []
+                i += 1
+                while i < len(lines) and not lines[i].strip().startswith("```"):
+                    body_lines.append(lines[i])
+                    i += 1
+                blocks.append((start + 1, "\n".join(body_lines)))
+            i += 1
+        return blocks
+
+    def _lint_block(self, body: str, start_line: int) -> list[str]:
+        issues: list[str] = []
+        lines = body.splitlines()
+        if not lines:
+            return ["empty mermaid block"]
+
+        # Find the first non-blank, non-comment line — it must be the graph header.
+        header = None
+        for ln in lines:
+            s = ln.strip()
+            if not s or s.startswith("%%"):
+                continue
+            header = s
+            break
+        if not header or not re.match(r'^(graph|flowchart)\s+(TD|TB|BT|RL|LR)\b', header):
+            issues.append(
+                "first non-blank line must be `graph TD` (or another valid "
+                f"`graph <DIR>` / `flowchart <DIR>`), got: {header!r}"
+            )
+
+        # Inline classDef application via `:::class` is rejected for portability.
+        for i, ln in enumerate(lines, start=start_line):
+            if ":::" in ln:
+                issues.append(
+                    f"line {i}: inline ':::' class styling is not allowed "
+                    "(use `class NodeA,NodeB level1` at the bottom instead)"
+                )
+
+        # Subgraph / end balance.
+        open_subgraphs = 0
+        for i, ln in enumerate(lines, start=start_line):
+            s = ln.strip()
+            if re.match(r'^subgraph\b', s):
+                open_subgraphs += 1
+                # Subgraph ID must be ASCII (token right after 'subgraph')
+                m = re.match(r'^subgraph\s+([^\s\[\(]+)', s)
+                if m and not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', m.group(1)):
+                    issues.append(
+                        f"line {i}: subgraph id {m.group(1)!r} must be ASCII letters/digits only "
+                        "(put display text inside `[\"...\"]`)"
+                    )
+            elif s == "end":
+                open_subgraphs -= 1
+                if open_subgraphs < 0:
+                    issues.append(f"line {i}: stray `end` without matching `subgraph`")
+                    open_subgraphs = 0
+        if open_subgraphs > 0:
+            issues.append(f"missing {open_subgraphs} `end` keyword(s) to close open subgraph(s)")
+
+        # Collect declared node IDs and edges.
+        declared: set[str] = set()
+        edge_refs: list[tuple[int, str, str]] = []  # (line, src, dst)
+
+        # A node declaration is any token that appears before `[`, `(`, `{`, `>` or stands alone on a line
+        # (excluding keywords and class lines).
+        for i, ln in enumerate(lines, start=start_line):
+            s = ln.strip()
+            if not s or s.startswith("%%"):
+                continue
+            if re.match(r'^(graph|flowchart|subgraph|end|classDef|class|linkStyle|click|direction|style)\b', s):
+                # classDef / class lines: collect node IDs from `class A,B level1`
+                m = re.match(r'^class\s+([A-Za-z0-9_,\s]+)\s+\w+', s)
+                if m:
+                    for nid in m.group(1).split(","):
+                        nid = nid.strip()
+                        if nid:
+                            edge_refs.append((i, nid, nid))  # treat as reference too
+                continue
+
+            # Split on edge operators to find endpoints. Mermaid edge ops:
+            # -->, --x, --o, -.->, ==>, ---, -.-, ===
+            edge_split = re.split(r'\s*(?:-->|---|--x|--o|-\.->|-\.-|==>|===)\s*', s)
+            tokens = [t.strip() for t in edge_split if t.strip()]
+
+            # Declare each endpoint and capture the bare ID.
+            endpoint_ids: list[str] = []
+            for tok in tokens:
+                # Strip an optional edge label like `-- "foo" -->` residue.
+                # An endpoint looks like:  ID  or  ID["Label"]  or  ID("Label")  or  ID{"Label"}
+                m = re.match(r'^([A-Za-z][A-Za-z0-9_]*)(\s*[\[\(\{].*)?$', tok)
+                if not m:
+                    # Could be an edge label fragment in quotes, skip silently.
+                    if not (tok.startswith('"') and tok.endswith('"')):
+                        issues.append(
+                            f"line {i}: cannot parse token {tok!r} as a node id "
+                            "(IDs must be ASCII letters/digits/underscore; put labels inside `[\"...\"]`)"
+                        )
+                    continue
+                nid = m.group(1)
+                if nid in self._KEYWORDS:
+                    continue
+                declared.add(nid)
+                endpoint_ids.append(nid)
+
+            # If we found 2+ endpoints, record edges between consecutive ones.
+            for a, b in zip(endpoint_ids, endpoint_ids[1:]):
+                edge_refs.append((i, a, b))
+
+        # Verify every edge references a declared node. (declared was populated
+        # from the same scan, so this mainly catches typos via `class` lines.)
+        for ln_no, a, b in edge_refs:
+            for nid in (a, b):
+                if nid and nid not in declared and nid not in self._KEYWORDS:
+                    issues.append(
+                        f"line {ln_no}: node id {nid!r} is referenced but never declared "
+                        "(add it as `NodeId[\"Label\"]` somewhere in the diagram)"
+                    )
+
+        return issues
+
+
 class ToolRegistry:
     """Registry of available tools."""
     
@@ -1332,6 +1544,7 @@ class ToolRegistry:
         self.tools["list_files"] = ListFilesTool(cwd)
         self.tools["grep"] = GrepTool(cwd)
         self.tools["web_search"] = WebSearchTool()
+        self.tools["mermaid_lint"] = MermaidLintTool(cwd)
         self.tools["done"] = DoneTool()
         if repo:
             self.tools["git_status"] = GitStatusTool(repo)

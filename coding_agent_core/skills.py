@@ -520,6 +520,20 @@ Respond with:
             "document", "documentation", "docstring", "readme",
             "guide", "explain", "jsdoc", "comment",
         ],
+        "architecture": [
+            "architecture", "architectural",
+            "architecture map", "architecture diagram", "architecture flow",
+            "flow diagram", "flow map", "data flow diagram",
+            "mermaid", "mermaid.js", "mermaidjs",
+            "c4 diagram", "c4 model",
+            "system context", "system overview",
+            "container diagram", "container level",
+            "component diagram", "component level",
+            "high-level overview", "high-level architecture",
+            "map the codebase", "map the repo", "map the repository",
+            "diagram the codebase", "diagram the system",
+            "visualize the architecture",
+        ],
     }
 
     # Minimum score required to override the default "feature" skill.
